@@ -29,25 +29,32 @@ import {
   AnimeSoundSynthesizer,
   AnimeVfxState,
 } from './utils/animeVfxEngine';
+import {
+  EphemeralRoomClient,
+  RoomMessage,
+} from './utils/ephemeralWsRoom';
+import alpinePhotoUrl from './assets/images/photo_alpine_architecture_1794361911541.jpg';
+import desertPhotoUrl from './assets/images/photo_desert_monolith_1794361911530.jpg';
+import coastalPhotoUrl from './assets/images/photo_coastal_horizon_1794361912038.jpg';
 
 const CURATED_PHOTOS: SpatialPhotoItem[] = [
   {
     id: 'alpine-pavilion',
     title: 'Alpine_Glass_Pavilion.RAW',
     subtitle: 'Out-of-Browser Desktop Window · 3840 × 2160',
-    dataUrl: '/src/assets/images/photo_alpine_architecture_1794361911541.jpg',
+    dataUrl: alpinePhotoUrl,
   },
   {
     id: 'desert-monolith',
     title: 'Desert_Obsidian_Monolith.RAW',
     subtitle: 'Out-of-Browser Desktop Window · 3840 × 2160',
-    dataUrl: '/src/assets/images/photo_desert_monolith_1794361911530.jpg',
+    dataUrl: desertPhotoUrl,
   },
   {
     id: 'coastal-horizon',
     title: 'Volcanic_Coastline.RAW',
     subtitle: 'Out-of-Browser Desktop Window · 3840 × 2160',
-    dataUrl: '/src/assets/images/photo_coastal_horizon_1794361912038.jpg',
+    dataUrl: coastalPhotoUrl,
   },
 ];
 
@@ -84,7 +91,7 @@ export default function App() {
   });
   const [peerConnected, setPeerConnected] = useState<boolean>(false);
   const [roomError, setRoomError] = useState<string | null>(null);
-  const [wsConnected, setWsConnected] = useState<boolean>(false);
+  const [wsConnected, setWsConnected] = useState<boolean>(true);
 
   const [showCodeModal, setShowCodeModal] = useState<boolean>(false);
   const [showPipPhonePreview, setShowPipPhonePreview] = useState<boolean>(true);
@@ -113,9 +120,8 @@ export default function App() {
   const [cameraActive, setCameraActive] = useState<boolean>(false);
   const [handDetected, setHandDetected] = useState<boolean>(false);
 
-  // Refs for WebSocket, 60fps per-frame camera, desktop capture, and Anime VFX loop
-  const wsRef = useRef<WebSocket | null>(null);
-  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  // Refs for Ephemeral WebSocket Room Client, 60fps per-frame camera, desktop capture, and Anime VFX loop
+  const roomClientRef = useRef<EphemeralRoomClient | null>(null);
   const createdRoomCodeRef = useRef<string>(createdRoomCode);
   createdRoomCodeRef.current = createdRoomCode;
   const activeRoomCodeRef = useRef<string>(activeRoomCode);
@@ -181,151 +187,92 @@ export default function App() {
   }, [createdRoomCode, activeRoomCode]);
 
   /**
-   * Establishes the stateless WebSocket connection to /ws and destroys the browser-stored room immediately on tab close.
+   * Establishes the serverless Ephemeral WebSocket Room Client (works on Vercel, mobile LTE, and localhost
+   * without ever spamming failed `/ws` requests) and destroys the browser-stored room immediately on tab close.
    */
   useEffect(() => {
     if (typeof window === 'undefined') return;
 
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${window.location.host}/ws`;
-    let ws: WebSocket | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-    let unmounted = false;
+    const handleRoomMessage = (msg: RoomMessage) => {
+      const type = msg.type;
+      const saved = loadRoomFromBrowserTab();
+      const myHostedCode = (saved?.role === 'creator' ? saved.code : '') || createdRoomCodeRef.current;
 
-    const connectWs = () => {
-      if (unmounted) return;
-      ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        setWsConnected(true);
-        // If this browser tab already created a room in sessionStorage, re-register live host socket
-        const saved = loadRoomFromBrowserTab();
-        if (saved && saved.role === 'creator' && saved.code) {
-          ws?.send(JSON.stringify({ type: 'host_room', code: saved.code }));
-        }
-      };
-
-      ws.onmessage = (event) => {
-        try {
-          const msg = JSON.parse(event.data);
-          const type = msg?.type;
-
-          if (type === 'peer_join_request') {
-            // Validate against this browser tab's own sessionStorage room
-            const saved = loadRoomFromBrowserTab();
-            const myHostedCode = saved?.code || createdRoomCodeRef.current;
-            if (myHostedCode && msg.code === myHostedCode) {
-              setPeerConnected(true);
-              saveRoomInBrowserTab({
-                code: myHostedCode,
-                role: 'creator',
-                createdAt: saved?.createdAt || Date.now(),
-                peerConnected: true,
-              });
-              ws?.send(
-                JSON.stringify({
-                  type: 'join_accepted',
-                  code: myHostedCode,
-                  timestamp: Date.now(),
-                })
-              );
-              // Automatically transition Creator into the Camera Stage when second device joins
-              setActiveRoomCode(myHostedCode);
-              setScreenMode('creator-stage');
-            }
-          } else if (type === 'join_accepted') {
-            setRoomError(null);
-            setPeerConnected(true);
-            setActiveRoomCode(msg.code);
-            saveRoomInBrowserTab({
-              code: msg.code,
-              role: 'joiner',
-              createdAt: Date.now(),
-              peerConnected: true,
-            });
-            setScreenMode('joiner-phone');
-          } else if (type === 'room_error') {
-            setRoomError(msg.message || 'Room not found or host tab was closed.');
-          } else if (type === 'photo_toss' && msg.photo) {
-            const incoming = msg.photo as DeliveredPhotoPayload;
-            setDeliveredPhoto(incoming);
-            setPhoneFullScreenOpen(true);
-            setPeerConnected(true);
-          } else if (type === 'room_destroyed') {
-            // Host tab closed -> immediately destroy room in browser and return to Landing Page
-            destroyRoomInBrowserTab();
-            setCreatedRoomCode('');
-            setActiveRoomCode('');
-            setPeerConnected(false);
-            setDeliveredPhoto(null);
-            setPhoneFullScreenOpen(false);
-            setScreenMode('landing');
-            setRoomError(msg.reason || 'Host browser tab closed — room was destroyed.');
-          } else if (type === 'peer_left') {
-            setPeerConnected(false);
-          }
-        } catch {
-          // Ignore malformed WS message
-        }
-      };
-
-      ws.onclose = () => {
-        setWsConnected(false);
-        if (!unmounted) {
-          reconnectTimer = setTimeout(connectWs, 1200);
-        }
-      };
-    };
-
-    connectWs();
-
-    // Cross-tab BroadcastChannel for same-browser two-tab testing (also strictly ephemeral, destroyed on tab close)
-    let bc: BroadcastChannel | null = null;
-    if (typeof BroadcastChannel !== 'undefined') {
-      bc = new BroadcastChannel('toss-ephemeral-ws-bridge');
-      broadcastChannelRef.current = bc;
-      bc.onmessage = (ev) => {
-        const msg = ev.data;
-        if (!msg) return;
-        const myHostedCode = loadRoomFromBrowserTab()?.code || createdRoomCodeRef.current;
-
-        if (msg.type === 'peer_join_request' && myHostedCode && msg.code === myHostedCode) {
+      if (type === 'peer_join_request') {
+        if (myHostedCode && msg.code === myHostedCode) {
           setPeerConnected(true);
-          bc?.postMessage({ type: 'join_accepted', code: myHostedCode });
+          saveRoomInBrowserTab({
+            code: myHostedCode,
+            role: 'creator',
+            createdAt: saved?.createdAt || Date.now(),
+            peerConnected: true,
+          });
+          roomClientRef.current?.sendRoomEvent({
+            type: 'join_accepted',
+            code: myHostedCode,
+          });
           setActiveRoomCode(myHostedCode);
           setScreenMode('creator-stage');
-        } else if (msg.type === 'join_accepted' && msg.code === activeRoomCodeRef.current) {
+        }
+      } else if (type === 'join_accepted') {
+        if (msg.code === activeRoomCodeRef.current) {
           setRoomError(null);
           setPeerConnected(true);
+          setActiveRoomCode(msg.code);
+          saveRoomInBrowserTab({
+            code: msg.code,
+            role: 'joiner',
+            createdAt: Date.now(),
+            peerConnected: true,
+          });
           setScreenMode('joiner-phone');
-        } else if (msg.type === 'photo_toss' && msg.code === activeRoomCodeRef.current && msg.photo) {
-          setDeliveredPhoto(msg.photo);
+        }
+      } else if (type === 'room_error') {
+        if (!peerConnected) {
+          setRoomError(msg.message || 'Room not found or host tab was closed.');
+        }
+      } else if (type === 'photo_toss' && msg.photo) {
+        if (!activeRoomCodeRef.current || msg.code === activeRoomCodeRef.current) {
+          const incoming = msg.photo as DeliveredPhotoPayload;
+          setDeliveredPhoto(incoming);
           setPhoneFullScreenOpen(true);
-        } else if (msg.type === 'room_destroyed' && msg.code === activeRoomCodeRef.current) {
+          setPeerConnected(true);
+        }
+      } else if (type === 'room_destroyed') {
+        if (!activeRoomCodeRef.current || msg.code === activeRoomCodeRef.current) {
           destroyRoomInBrowserTab();
           setCreatedRoomCode('');
           setActiveRoomCode('');
           setPeerConnected(false);
           setDeliveredPhoto(null);
+          setPhoneFullScreenOpen(false);
           setScreenMode('landing');
-          setRoomError('Host browser tab closed — room was destroyed.');
+          setRoomError(msg.reason || 'Host browser tab closed — room was destroyed.');
         }
-      };
+      } else if (type === 'peer_left') {
+        setPeerConnected(false);
+      }
+    };
+
+    const client = new EphemeralRoomClient(handleRoomMessage, (connected) => {
+      setWsConnected(connected);
+    });
+    roomClientRef.current = client;
+    client.start();
+
+    // If this browser tab already created a room in sessionStorage, re-register live host topic
+    const existingRoom = loadRoomFromBrowserTab();
+    if (existingRoom && existingRoom.role === 'creator' && existingRoom.code) {
+      client.hostRoom(existingRoom.code);
     }
 
     // Destroy room in browser storage & notify peer as soon as the host tab is closed
     const handleTabUnload = () => {
       const saved = loadRoomFromBrowserTab();
-      const codeToDestroy = saved?.code || createdRoomCodeRef.current;
+      const codeToDestroy = (saved?.role === 'creator' ? saved.code : '') || createdRoomCodeRef.current;
       destroyRoomInBrowserTab();
       if (codeToDestroy) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'destroy_room', code: codeToDestroy }));
-        }
-        if (bc) {
-          bc.postMessage({ type: 'room_destroyed', code: codeToDestroy });
-        }
+        client.destroyRoom(codeToDestroy);
       }
     };
 
@@ -333,12 +280,9 @@ export default function App() {
     window.addEventListener('pagehide', handleTabUnload);
 
     return () => {
-      unmounted = true;
       window.removeEventListener('beforeunload', handleTabUnload);
       window.removeEventListener('pagehide', handleTabUnload);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      if (ws) ws.close();
-      if (bc) bc.close();
+      client.stop();
     };
   }, []);
 
@@ -361,9 +305,7 @@ export default function App() {
       peerConnected: false,
     });
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'host_room', code: newCode }));
-    }
+    roomClientRef.current?.hostRoom(newCode);
   };
 
   /**
@@ -373,12 +315,7 @@ export default function App() {
     const code = createdRoomCode || activeRoomCode;
     destroyRoomInBrowserTab();
     if (code) {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'destroy_room', code }));
-      }
-      if (broadcastChannelRef.current) {
-        broadcastChannelRef.current.postMessage({ type: 'room_destroyed', code });
-      }
+      roomClientRef.current?.destroyRoom(code);
     }
     setCreatedRoomCode('');
     setActiveRoomCode('');
@@ -409,15 +346,7 @@ export default function App() {
       return;
     }
 
-    if (broadcastChannelRef.current) {
-      broadcastChannelRef.current.postMessage({ type: 'peer_join_request', code: cleaned });
-    }
-
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'join_room', code: cleaned }));
-    } else {
-      setRoomError('WebSocket connecting — please try again in a moment.');
-    }
+    roomClientRef.current?.joinRoom(cleaned);
   };
 
   /**
@@ -437,7 +366,7 @@ export default function App() {
       const ctx = offscreen.getContext('2d');
       if (!ctx) return activePhotoRef.current;
       ctx.drawImage(dVideo, 0, 0, vw, vh);
-      const dataUrl = offscreen.toDataURL('image/jpeg', 0.92);
+      const dataUrl = offscreen.toDataURL('image/jpeg', 0.88);
       const snapped: SpatialPhotoItem = {
         id: `desktop-snap-${Date.now()}`,
         title: `Laptop_Screen_Capture.RAW`,
@@ -453,41 +382,69 @@ export default function App() {
   }, []);
 
   /**
+   * Converts any image URL into a self-contained base64 JPEG data URL so it streams
+   * across WebSockets between any two devices (e.g. Laptop on Wi-Fi to Phone on 5G).
+   */
+  const ensurePortableDataUrl = useCallback(async (srcUrl: string): Promise<string> => {
+    if (srcUrl.startsWith('data:image/')) {
+      return srcUrl;
+    }
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        try {
+          const maxDim = 1280;
+          const scale = Math.min(1, maxDim / Math.max(img.naturalWidth || 1280, img.naturalHeight || 720));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round((img.naturalWidth || 1280) * scale);
+          canvas.height = Math.round((img.naturalHeight || 720) * scale);
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve(srcUrl);
+            return;
+          }
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/jpeg', 0.84));
+        } catch {
+          resolve(srcUrl);
+        }
+      };
+      img.onerror = () => resolve(srcUrl);
+      img.src = srcUrl;
+    });
+  }, []);
+
+  /**
    * Streams the grabbed photo directly over WebSocket (and BroadcastChannel) to the joined phone tab
    * without saving anything on the server.
    */
   const deliverPhotoToPhone = useCallback(
     (photo: SpatialPhotoItem) => {
       const code = activeRoomCodeRef.current || createdRoomCodeRef.current || '4829';
-      const payload: DeliveredPhotoPayload = {
+      const immediatePayload: DeliveredPhotoPayload = {
         id: `${photo.id}-${Date.now()}`,
         title: photo.title,
         dataUrl: photo.dataUrl,
         timestamp: Date.now(),
       };
 
-      setDeliveredPhoto(payload);
+      setDeliveredPhoto(immediatePayload);
       setPhoneFullScreenOpen(true);
 
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'photo_toss',
-            code,
-            photo: payload,
-          })
-        );
-      }
-
-      if (broadcastChannelRef.current) {
-        broadcastChannelRef.current.postMessage({
+      ensurePortableDataUrl(photo.dataUrl).then((portableDataUrl) => {
+        const networkPayload: DeliveredPhotoPayload = {
+          ...immediatePayload,
+          dataUrl: portableDataUrl,
+        };
+        roomClientRef.current?.sendRoomEvent({
           type: 'photo_toss',
           code,
-          photo: payload,
+          photo: networkPayload,
         });
-      }
+      });
     },
-    []
+    [ensurePortableDataUrl]
   );
 
   /**

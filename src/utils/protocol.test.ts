@@ -282,5 +282,59 @@ test('Browser-only room storage saves in tab storage and destroys cleanly on tab
   assert.equal(loadRoomFromBrowserTab(mockStorage), null);
 });
 
+import {
+  isStaticDeploymentHost,
+  encodeMqttConnectPacket,
+  encodeMqttSubscribePacket,
+  encodeMqttPublishPacket,
+  decodeMqttPackets,
+  splitRoomMessageIntoFrames,
+  RoomChunkAssembler,
+  RoomMessage,
+} from './ephemeralWsRoom';
 
+test('Serverless WebSocket room transport detects Vercel static host, encodes/decodes MQTT WebSocket frames, and chunks large photos', () => {
+  assert.equal(isStaticDeploymentHost('fileee-six.vercel.app'), true);
+  assert.equal(isStaticDeploymentHost('my-app.netlify.app'), true);
+  assert.equal(isStaticDeploymentHost('localhost'), false);
 
+  const connectPkt = encodeMqttConnectPacket('client_123', 'toss/ephemeral/v1/room/7204', '{"type":"room_destroyed"}');
+  assert.equal(connectPkt[0], 0x10);
+
+  const subPkt = encodeMqttSubscribePacket(42, 'toss/ephemeral/v1/room/7204');
+  assert.equal(subPkt[0], 0x82);
+
+  const pubPkt = encodeMqttPublishPacket(
+    'toss/ephemeral/v1/room/7204',
+    JSON.stringify({ type: 'join_accepted', code: '7204' })
+  );
+  const decoded = decodeMqttPackets(pubPkt);
+  assert.equal(decoded.events.length, 1);
+  assert.equal(decoded.events[0].type, 'publish');
+  assert.equal(decoded.events[0].topic, 'toss/ephemeral/v1/room/7204');
+  assert.deepEqual(JSON.parse(decoded.events[0].payload!), { type: 'join_accepted', code: '7204' });
+
+  // Test large 80KB photo splitting and reassembly
+  const largePhotoMsg: RoomMessage = {
+    type: 'photo_toss',
+    code: '7204',
+    photo: {
+      id: 'photo-1',
+      title: 'Alpine.RAW',
+      dataUrl: 'data:image/jpeg;base64,' + 'A'.repeat(80000),
+      timestamp: 1700000000000,
+    },
+  };
+  const frames = splitRoomMessageIntoFrames(largePhotoMsg);
+  assert.ok(frames.length >= 4);
+  assert.equal(frames[0].type, '_chunk');
+
+  const assembler = new RoomChunkAssembler();
+  let finalMsg: RoomMessage | null = null;
+  for (const frame of frames) {
+    finalMsg = assembler.push(frame);
+  }
+  assert.ok(finalMsg);
+  assert.equal(finalMsg.type, 'photo_toss');
+  assert.equal(finalMsg.photo?.dataUrl.length, largePhotoMsg.photo!.dataUrl.length);
+});

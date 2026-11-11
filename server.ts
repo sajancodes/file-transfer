@@ -18,6 +18,11 @@ async function startServer() {
   const httpServer = http.createServer(app);
   const PORT = 3000;
 
+  app.get('/api/ws-health', (_req: Request, res: Response) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.json({ ok: true, localWs: true });
+  });
+
   // Stateless WebSocket Relay — Zero rooms or photos are saved on the server.
   // All room state lives exclusively in the host browser tab (sessionStorage / memory)
   // and is destroyed the instant the host browser tab closes.
