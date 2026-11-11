@@ -199,3 +199,28 @@ test('Phase 4 & 6 pinch hysteresis and gesture velocity throw vs cancel spring-b
   assert.equal(tiltReduced.rotateYDeg, 0);
   assert.equal(tiltReduced.scale, 1);
 });
+
+import {
+  normalizeRoomCode,
+  isHandInPhoneDeliveryZone,
+  computeCinematicHandTransform,
+} from './spatialToss';
+
+test('Spatial 4-digit code normalization, phone zone delivery detection, and cinematic hand collapse', () => {
+  assert.equal(normalizeRoomCode('48-299'), '4829');
+  assert.equal(isHandInPhoneDeliveryZone({ x: 0.5, y: 0.5 }), false);
+  assert.equal(isHandInPhoneDeliveryZone({ x: 0.85, y: 0.5 }), true);
+  assert.equal(isHandInPhoneDeliveryZone({ x: 0.5, y: 0.10 }), true);
+
+  const openTransform = computeCinematicHandTransform('PHOTO_OPEN', { x: 0.5, y: 0.5 }, { x: 0, y: 0 });
+  assert.equal(openTransform.scale, 1);
+  assert.equal(openTransform.opacity, 1);
+
+  const heldTransform = computeCinematicHandTransform('HOLDING_IN_HAND', { x: 0.6, y: 0.4 }, { x: 0.001, y: -0.001 });
+  assert.equal(heldTransform.scale, 0.22);
+  assert.ok(heldTransform.rotateY > 0);
+
+  const deliveredTransform = computeCinematicHandTransform('DELIVERED', { x: 0.9, y: 0.5 }, { x: 0, y: 0 });
+  assert.equal(deliveredTransform.opacity, 0);
+});
+
