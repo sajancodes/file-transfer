@@ -10,6 +10,10 @@ import {
   SpatialStagePhase,
   HandPoint,
   normalizeRoomCode,
+  generateFourDigitCode,
+  saveRoomInBrowserTab,
+  loadRoomFromBrowserTab,
+  destroyRoomInBrowserTab,
   isHandInPhoneDeliveryZone,
   computeCinematicHandTransform,
 } from './utils/spatialToss';
@@ -17,24 +21,32 @@ import {
   smoothPoint2D,
   evaluatePinchHysteresis,
 } from './utils/gestureMachine';
+import {
+  createInitialAnimeVfxState,
+  triggerAnimeGrabVfx,
+  triggerAnimeLaunchVfx,
+  stepAndRenderAnimeVfxCanvas,
+  AnimeSoundSynthesizer,
+  AnimeVfxState,
+} from './utils/animeVfxEngine';
 
 const CURATED_PHOTOS: SpatialPhotoItem[] = [
   {
     id: 'alpine-pavilion',
-    title: 'Alpine Glass Pavilion',
-    subtitle: '3840 × 2160 · RAW Editorial',
+    title: 'Alpine_Glass_Pavilion.RAW',
+    subtitle: 'Out-of-Browser Desktop Window · 3840 × 2160',
     dataUrl: '/src/assets/images/photo_alpine_architecture_1794361911541.jpg',
   },
   {
     id: 'desert-monolith',
-    title: 'Desert Obsidian Monolith',
-    subtitle: '3840 × 2160 · RAW Editorial',
+    title: 'Desert_Obsidian_Monolith.RAW',
+    subtitle: 'Out-of-Browser Desktop Window · 3840 × 2160',
     dataUrl: '/src/assets/images/photo_desert_monolith_1794361911530.jpg',
   },
   {
     id: 'coastal-horizon',
-    title: 'Volcanic Coastline',
-    subtitle: '3840 × 2160 · RAW Editorial',
+    title: 'Volcanic_Coastline.RAW',
+    subtitle: 'Out-of-Browser Desktop Window · 3840 × 2160',
     dataUrl: '/src/assets/images/photo_coastal_horizon_1794361912038.jpg',
   },
 ];
@@ -46,26 +58,51 @@ interface DeliveredPhotoPayload {
   timestamp: number;
 }
 
-export default function App() {
-  // Determine initial mode & code from URL (?code=4829&role=phone)
-  const initialParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
-  const urlCode = normalizeRoomCode(initialParams?.get('code') || '') || '4829';
-  const urlRole = initialParams?.get('role') === 'phone' ? 'phone' : 'computer';
+type AppScreenMode = 'landing' | 'creator-stage' | 'joiner-phone';
 
-  const [deviceRole, setDeviceRole] = useState<'computer' | 'phone'>(urlRole);
-  const [roomCode, setRoomCode] = useState<string>(urlCode);
-  const [phoneCodeInput, setPhoneCodeInput] = useState<string>(urlCode);
-  const [phoneConnected, setPhoneConnected] = useState<boolean>(false);
+export default function App() {
+  const initialParams = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null;
+  const autostart = initialParams?.get('autostart') === '1';
+  const urlJoinCode = normalizeRoomCode(initialParams?.get('code') || '');
+
+  const [screenMode, setScreenMode] = useState<AppScreenMode>(() => {
+    if (autostart) return 'creator-stage';
+    return 'landing';
+  });
+
+  // Room state saved exclusively in browser sessionStorage (destroyed on tab close)
+  const [createdRoomCode, setCreatedRoomCode] = useState<string>(() => {
+    const existing = loadRoomFromBrowserTab();
+    if (existing && existing.role === 'creator') return existing.code;
+    if (autostart) return '4829';
+    return '';
+  });
+  const [joinCodeInput, setJoinCodeInput] = useState<string>(urlJoinCode);
+  const [activeRoomCode, setActiveRoomCode] = useState<string>(() => {
+    const existing = loadRoomFromBrowserTab();
+    return existing?.code || (autostart ? '4829' : '');
+  });
+  const [peerConnected, setPeerConnected] = useState<boolean>(false);
+  const [roomError, setRoomError] = useState<string | null>(null);
+  const [wsConnected, setWsConnected] = useState<boolean>(false);
+
   const [showCodeModal, setShowCodeModal] = useState<boolean>(false);
   const [showPipPhonePreview, setShowPipPhonePreview] = useState<boolean>(true);
   const [qrSvg, setQrSvg] = useState<string>('');
+  const [sfxMuted, setSfxMuted] = useState<boolean>(false);
 
-  // Photo Library & Open Photo on Computer Screen
+  // Out-of-Browser Laptop Screen Capture (getDisplayMedia + Pop-out OS Window)
+  const [desktopStreamActive, setDesktopStreamActive] = useState<boolean>(false);
+  const [desktopSurfaceName, setDesktopSurfaceName] = useState<string>('Desktop OS Viewer');
+  const [externalPipWindowOpen, setExternalPipWindowOpen] = useState<boolean>(false);
+
+  // Photo Library & Open Photo on Laptop Screen
   const [photos, setPhotos] = useState<SpatialPhotoItem[]>(CURATED_PHOTOS);
   const [activePhoto, setActivePhoto] = useState<SpatialPhotoItem | null>(CURATED_PHOTOS[0]);
   const [stagePhase, setStagePhase] = useState<SpatialStagePhase>('PHOTO_OPEN');
+  const [animeActionBanner, setAnimeActionBanner] = useState<string | null>(null);
   const [statusCaption, setStatusCaption] = useState<string>(
-    'Pinch or grab the photo with your hand, then bring it toward your phone edge to deliver.'
+    'Hand Tracking Ready — Pinch/Grab the open laptop photo to rip it into your hand with Anime Spatial VFX.'
   );
 
   // Delivered Photo on Phone (Opens in Full Screen on Phone)
@@ -75,19 +112,33 @@ export default function App() {
   // Full-Screen Camera & Hand Tracking state
   const [cameraActive, setCameraActive] = useState<boolean>(false);
   const [handDetected, setHandDetected] = useState<boolean>(false);
-  const [handPinching, setHandPinching] = useState<boolean>(false);
 
-  // Refs for 60fps per-frame camera & hand tracking (isolated from React re-renders)
+  // Refs for WebSocket, 60fps per-frame camera, desktop capture, and Anime VFX loop
+  const wsRef = useRef<WebSocket | null>(null);
+  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  const createdRoomCodeRef = useRef<string>(createdRoomCode);
+  createdRoomCodeRef.current = createdRoomCode;
+  const activeRoomCodeRef = useRef<string>(activeRoomCode);
+  activeRoomCodeRef.current = activeRoomCode;
+  const screenModeRef = useRef<AppScreenMode>(screenMode);
+  screenModeRef.current = screenMode;
+
+  const stageRootRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const desktopVideoRef = useRef<HTMLVideoElement | null>(null);
   const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const photoStageElementRef = useRef<HTMLDivElement | null>(null);
   const handOrbElementRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const cameraStreamRef = useRef<MediaStream | null>(null);
+  const desktopStreamRef = useRef<MediaStream | null>(null);
+  const externalPipWindowRef = useRef<Window | null>(null);
   const handLandmarkerRef = useRef<any>(null);
-  const rafIdRef = useRef<number | null>(null);
-  const broadcastChannelRef = useRef<BroadcastChannel | null>(null);
+  const vfxRafIdRef = useRef<number | null>(null);
+  const cameraRafIdRef = useRef<number | null>(null);
+  const sfxRef = useRef<AnimeSoundSynthesizer>(new AnimeSoundSynthesizer());
+
+  const animeVfxStateRef = useRef<AnimeVfxState>(createInitialAnimeVfxState());
 
   const handStateRef = useRef<{
     pos: HandPoint;
@@ -111,10 +162,15 @@ export default function App() {
   const activePhotoRef = useRef<SpatialPhotoItem | null>(activePhoto);
   activePhotoRef.current = activePhoto;
 
-  // Generate QR code for instant phone pairing
+  // Generate QR code whenever a room is created in the browser
   useEffect(() => {
+    const codeForQr = createdRoomCode || activeRoomCode;
+    if (!codeForQr) {
+      setQrSvg('');
+      return;
+    }
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
-    const pairUrl = `${origin}/?code=${roomCode}&role=phone`;
+    const pairUrl = `${origin}/?code=${codeForQr}`;
     QRCode.toString(pairUrl, {
       type: 'svg',
       margin: 1,
@@ -122,81 +178,287 @@ export default function App() {
     })
       .then((svg) => setQrSvg(svg))
       .catch(() => {});
-  }, [roomCode]);
+  }, [createdRoomCode, activeRoomCode]);
 
-  // Connect to real-time 4-digit room on server + BroadcastChannel
+  /**
+   * Establishes the stateless WebSocket connection to /ws and destroys the browser-stored room immediately on tab close.
+   */
   useEffect(() => {
-    const cleanCode = normalizeRoomCode(roomCode) || '4829';
+    if (typeof window === 'undefined') return;
 
-    // Register role in room
-    fetch(`/api/rooms/${cleanCode}/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ role: deviceRole }),
-    })
-      .then((r) => r.json())
-      .then((data) => {
-        if (data?.phoneConnected) {
-          setPhoneConnected(true);
-        }
-        if (data?.latestPhoto && deviceRole === 'phone') {
-          setDeliveredPhoto(data.latestPhoto);
-          setPhoneFullScreenOpen(true);
-        }
-      })
-      .catch(() => {});
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${proto}//${window.location.host}/ws`;
+    let ws: WebSocket | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let unmounted = false;
 
-    // Subscribe to Server-Sent Events for this 4-digit code
-    const es = new EventSource(`/api/rooms/${cleanCode}/events`);
-    es.onmessage = (event) => {
-      try {
-        const parsed = JSON.parse(event.data);
-        if (parsed.type === 'peer:joined') {
-          if (parsed.payload?.phoneConnected) {
-            setPhoneConnected(true);
+    const connectWs = () => {
+      if (unmounted) return;
+      ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setWsConnected(true);
+        // If this browser tab already created a room in sessionStorage, re-register live host socket
+        const saved = loadRoomFromBrowserTab();
+        if (saved && saved.role === 'creator' && saved.code) {
+          ws?.send(JSON.stringify({ type: 'host_room', code: saved.code }));
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          const type = msg?.type;
+
+          if (type === 'peer_join_request') {
+            // Validate against this browser tab's own sessionStorage room
+            const saved = loadRoomFromBrowserTab();
+            const myHostedCode = saved?.code || createdRoomCodeRef.current;
+            if (myHostedCode && msg.code === myHostedCode) {
+              setPeerConnected(true);
+              saveRoomInBrowserTab({
+                code: myHostedCode,
+                role: 'creator',
+                createdAt: saved?.createdAt || Date.now(),
+                peerConnected: true,
+              });
+              ws?.send(
+                JSON.stringify({
+                  type: 'join_accepted',
+                  code: myHostedCode,
+                  timestamp: Date.now(),
+                })
+              );
+              // Automatically transition Creator into the Camera Stage when second device joins
+              setActiveRoomCode(myHostedCode);
+              setScreenMode('creator-stage');
+            }
+          } else if (type === 'join_accepted') {
+            setRoomError(null);
+            setPeerConnected(true);
+            setActiveRoomCode(msg.code);
+            saveRoomInBrowserTab({
+              code: msg.code,
+              role: 'joiner',
+              createdAt: Date.now(),
+              peerConnected: true,
+            });
+            setScreenMode('joiner-phone');
+          } else if (type === 'room_error') {
+            setRoomError(msg.message || 'Room not found or host tab was closed.');
+          } else if (type === 'photo_toss' && msg.photo) {
+            const incoming = msg.photo as DeliveredPhotoPayload;
+            setDeliveredPhoto(incoming);
+            setPhoneFullScreenOpen(true);
+            setPeerConnected(true);
+          } else if (type === 'room_destroyed') {
+            // Host tab closed -> immediately destroy room in browser and return to Landing Page
+            destroyRoomInBrowserTab();
+            setCreatedRoomCode('');
+            setActiveRoomCode('');
+            setPeerConnected(false);
+            setDeliveredPhoto(null);
+            setPhoneFullScreenOpen(false);
+            setScreenMode('landing');
+            setRoomError(msg.reason || 'Host browser tab closed — room was destroyed.');
+          } else if (type === 'peer_left') {
+            setPeerConnected(false);
           }
-        } else if (parsed.type === 'photo:delivered' && parsed.payload) {
-          const incoming = parsed.payload as DeliveredPhotoPayload;
-          setDeliveredPhoto(incoming);
-          setPhoneFullScreenOpen(true);
-          setPhoneConnected(true);
+        } catch {
+          // Ignore malformed WS message
         }
-      } catch {
-        // Ignore malformed SSE message
-      }
+      };
+
+      ws.onclose = () => {
+        setWsConnected(false);
+        if (!unmounted) {
+          reconnectTimer = setTimeout(connectWs, 1200);
+        }
+      };
     };
 
-    // Also attach BroadcastChannel for instant cross-tab sync
+    connectWs();
+
+    // Cross-tab BroadcastChannel for same-browser two-tab testing (also strictly ephemeral, destroyed on tab close)
     let bc: BroadcastChannel | null = null;
     if (typeof BroadcastChannel !== 'undefined') {
-      bc = new BroadcastChannel(`toss-room-${cleanCode}`);
+      bc = new BroadcastChannel('toss-ephemeral-ws-bridge');
       broadcastChannelRef.current = bc;
       bc.onmessage = (ev) => {
         const msg = ev.data;
-        if (msg?.type === 'phone:connected') {
-          setPhoneConnected(true);
-        } else if (msg?.type === 'photo:delivered' && msg.photo) {
+        if (!msg) return;
+        const myHostedCode = loadRoomFromBrowserTab()?.code || createdRoomCodeRef.current;
+
+        if (msg.type === 'peer_join_request' && myHostedCode && msg.code === myHostedCode) {
+          setPeerConnected(true);
+          bc?.postMessage({ type: 'join_accepted', code: myHostedCode });
+          setActiveRoomCode(myHostedCode);
+          setScreenMode('creator-stage');
+        } else if (msg.type === 'join_accepted' && msg.code === activeRoomCodeRef.current) {
+          setRoomError(null);
+          setPeerConnected(true);
+          setScreenMode('joiner-phone');
+        } else if (msg.type === 'photo_toss' && msg.code === activeRoomCodeRef.current && msg.photo) {
           setDeliveredPhoto(msg.photo);
           setPhoneFullScreenOpen(true);
-          setPhoneConnected(true);
+        } else if (msg.type === 'room_destroyed' && msg.code === activeRoomCodeRef.current) {
+          destroyRoomInBrowserTab();
+          setCreatedRoomCode('');
+          setActiveRoomCode('');
+          setPeerConnected(false);
+          setDeliveredPhoto(null);
+          setScreenMode('landing');
+          setRoomError('Host browser tab closed — room was destroyed.');
         }
       };
-      if (deviceRole === 'phone') {
-        bc.postMessage({ type: 'phone:connected', code: cleanCode });
-      }
     }
 
+    // Destroy room in browser storage & notify peer as soon as the host tab is closed
+    const handleTabUnload = () => {
+      const saved = loadRoomFromBrowserTab();
+      const codeToDestroy = saved?.code || createdRoomCodeRef.current;
+      destroyRoomInBrowserTab();
+      if (codeToDestroy) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'destroy_room', code: codeToDestroy }));
+        }
+        if (bc) {
+          bc.postMessage({ type: 'room_destroyed', code: codeToDestroy });
+        }
+      }
+    };
+
+    window.addEventListener('beforeunload', handleTabUnload);
+    window.addEventListener('pagehide', handleTabUnload);
+
     return () => {
-      es.close();
+      unmounted = true;
+      window.removeEventListener('beforeunload', handleTabUnload);
+      window.removeEventListener('pagehide', handleTabUnload);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (ws) ws.close();
       if (bc) bc.close();
     };
-  }, [roomCode, deviceRole]);
+  }, []);
 
   /**
-   * Sends the grabbed photo to the connected phone (server SSE + BroadcastChannel)
+   * Creates a new 4-digit Room in the browser (sessionStorage) and registers host on WebSocket
+   */
+  const handleCreateRoom = () => {
+    setRoomError(null);
+    const newCode = generateFourDigitCode();
+    setCreatedRoomCode(newCode);
+    createdRoomCodeRef.current = newCode;
+    setActiveRoomCode(newCode);
+    activeRoomCodeRef.current = newCode;
+    setPeerConnected(false);
+
+    saveRoomInBrowserTab({
+      code: newCode,
+      role: 'creator',
+      createdAt: Date.now(),
+      peerConnected: false,
+    });
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'host_room', code: newCode }));
+    }
+  };
+
+  /**
+   * Destroys the currently active browser room and returns all connected devices to the Landing Page
+   */
+  const handleDestroyRoomNow = () => {
+    const code = createdRoomCode || activeRoomCode;
+    destroyRoomInBrowserTab();
+    if (code) {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'destroy_room', code }));
+      }
+      if (broadcastChannelRef.current) {
+        broadcastChannelRef.current.postMessage({ type: 'room_destroyed', code });
+      }
+    }
+    setCreatedRoomCode('');
+    setActiveRoomCode('');
+    setPeerConnected(false);
+    setDeliveredPhoto(null);
+    setPhoneFullScreenOpen(false);
+    setScreenMode('landing');
+  };
+
+  /**
+   * Joins an existing room created by another device's browser tab via WebSocket
+   */
+  const handleJoinRoomSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleaned = normalizeRoomCode(joinCodeInput);
+    if (cleaned.length !== 4) {
+      setRoomError('Enter the 4-digit code shown on the Create Room device.');
+      return;
+    }
+    setRoomError(null);
+    setActiveRoomCode(cleaned);
+    activeRoomCodeRef.current = cleaned;
+
+    // If joining the room created in this same tab (for single-machine testing), accept immediately
+    if (createdRoomCode && cleaned === createdRoomCode) {
+      setPeerConnected(true);
+      setScreenMode('joiner-phone');
+      return;
+    }
+
+    if (broadcastChannelRef.current) {
+      broadcastChannelRef.current.postMessage({ type: 'peer_join_request', code: cleaned });
+    }
+
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'join_room', code: cleaned }));
+    } else {
+      setRoomError('WebSocket connecting — please try again in a moment.');
+    }
+  };
+
+  /**
+   * Captures a high-resolution snapshot from the live out-of-browser Laptop Screen stream (getDisplayMedia)
+   */
+  const snapFrameFromDesktopStreamIfActive = useCallback((): SpatialPhotoItem | null => {
+    const dVideo = desktopVideoRef.current;
+    if (!desktopStreamRef.current || !dVideo || dVideo.readyState < 2) {
+      return activePhotoRef.current;
+    }
+    try {
+      const vw = dVideo.videoWidth || 1280;
+      const vh = dVideo.videoHeight || 720;
+      const offscreen = document.createElement('canvas');
+      offscreen.width = vw;
+      offscreen.height = vh;
+      const ctx = offscreen.getContext('2d');
+      if (!ctx) return activePhotoRef.current;
+      ctx.drawImage(dVideo, 0, 0, vw, vh);
+      const dataUrl = offscreen.toDataURL('image/jpeg', 0.92);
+      const snapped: SpatialPhotoItem = {
+        id: `desktop-snap-${Date.now()}`,
+        title: `Laptop_Screen_Capture.RAW`,
+        subtitle: `Out-of-Browser OS Capture (${vw}×${vh})`,
+        dataUrl,
+      };
+      activePhotoRef.current = snapped;
+      setActivePhoto(snapped);
+      return snapped;
+    } catch {
+      return activePhotoRef.current;
+    }
+  }, []);
+
+  /**
+   * Streams the grabbed photo directly over WebSocket (and BroadcastChannel) to the joined phone tab
+   * without saving anything on the server.
    */
   const deliverPhotoToPhone = useCallback(
-    async (photo: SpatialPhotoItem) => {
+    (photo: SpatialPhotoItem) => {
+      const code = activeRoomCodeRef.current || createdRoomCodeRef.current || '4829';
       const payload: DeliveredPhotoPayload = {
         id: `${photo.id}-${Date.now()}`,
         title: photo.title,
@@ -204,144 +466,156 @@ export default function App() {
         timestamp: Date.now(),
       };
 
-      // Update local state immediately so PiP phone preview & phone mode open it in full screen
       setDeliveredPhoto(payload);
       setPhoneFullScreenOpen(true);
-      setPhoneConnected(true);
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'photo_toss',
+            code,
+            photo: payload,
+          })
+        );
+      }
 
       if (broadcastChannelRef.current) {
         broadcastChannelRef.current.postMessage({
-          type: 'photo:delivered',
+          type: 'photo_toss',
+          code,
           photo: payload,
         });
       }
-
-      try {
-        await fetch(`/api/rooms/${roomCode}/toss`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ photo: payload }),
-        });
-      } catch {
-        // Local & BroadcastChannel delivery already succeeded
-      }
     },
-    [roomCode]
+    []
   );
 
   /**
-   * Updates the 60fps DOM elements (full-screen photo collapse + floating camera hand orb + canvas reticle)
+   * Continuous 60fps Anime Action VFX + Hand Energy Core Render Loop
    */
-  const renderSpatialFrame = useCallback(() => {
-    const hs = handStateRef.current;
-    const phase = stagePhaseRef.current;
-    const canvas = overlayCanvasRef.current;
+  useEffect(() => {
+    if (screenMode !== 'creator-stage') return;
 
-    if (canvas) {
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        const w = canvas.width;
-        const h = canvas.height;
-        ctx.clearRect(0, 0, w, h);
+    let running = true;
+    const renderLoop = () => {
+      if (!running) return;
+      const hs = handStateRef.current;
+      const phase = stagePhaseRef.current;
+      const vfx = animeVfxStateRef.current;
+      const canvas = overlayCanvasRef.current;
 
-        // Draw subtle Phone Delivery Target Zone along the right edge
-        const inZone = isHandInPhoneDeliveryZone(hs.pos, hs.velocity);
-        ctx.save();
-        ctx.strokeStyle =
-          phase === 'HOLDING_IN_HAND' || phase === 'GRABBING_CLOSING'
-            ? inZone
-              ? 'rgba(34, 197, 94, 0.85)'
-              : 'rgba(255, 255, 255, 0.28)'
-            : 'rgba(255, 255, 255, 0.10)';
-        ctx.lineWidth = inZone ? 3 : 1.5;
-        ctx.setLineDash([8, 8]);
-        ctx.beginPath();
-        ctx.moveTo(w * 0.82, 24);
-        ctx.lineTo(w * 0.82, h - 24);
-        ctx.stroke();
-        ctx.restore();
+      if (canvas) {
+        if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
+          canvas.width = window.innerWidth;
+          canvas.height = window.innerHeight;
+        }
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          const w = canvas.width;
+          const h = canvas.height;
+          ctx.clearRect(0, 0, w, h);
 
-        // Draw motion trail when holding a grabbed photo in hand
-        if (hs.trail.length > 1 && (phase === 'HOLDING_IN_HAND' || phase === 'GRABBING_CLOSING' || phase === 'DELIVERING')) {
-          ctx.save();
-          for (let i = 1; i < hs.trail.length; i++) {
-            const p0 = hs.trail[i - 1];
-            const p1 = hs.trail[i];
-            const alpha = (i / hs.trail.length) * 0.65;
-            ctx.strokeStyle = `rgba(255, 255, 255, ${alpha.toFixed(2)})`;
-            ctx.lineWidth = (i / hs.trail.length) * 6;
-            ctx.lineCap = 'round';
-            ctx.beginPath();
-            ctx.moveTo(p0.x * w, p0.y * h);
-            ctx.lineTo(p1.x * w, p1.y * h);
-            ctx.stroke();
+          const isHolding = phase === 'HOLDING_IN_HAND' || phase === 'GRABBING_CLOSING';
+          stepAndRenderAnimeVfxCanvas(ctx, w, h, vfx, hs.pos, isHolding, hs.isPinched);
+
+          if (hs.trail.length > 1 && (isHolding || phase === 'DELIVERING')) {
+            ctx.save();
+            for (let i = 1; i < hs.trail.length; i++) {
+              const p0 = hs.trail[i - 1];
+              const p1 = hs.trail[i];
+              const ratio = i / hs.trail.length;
+              ctx.strokeStyle =
+                i % 2 === 0
+                  ? `rgba(56, 189, 248, ${(ratio * 0.75).toFixed(2)})`
+                  : `rgba(244, 63, 94, ${(ratio * 0.75).toFixed(2)})`;
+              ctx.lineWidth = ratio * 10;
+              ctx.lineCap = 'round';
+              ctx.beginPath();
+              ctx.moveTo(p0.x * w, p0.y * h);
+              ctx.lineTo(p1.x * w, p1.y * h);
+              ctx.stroke();
+            }
+            ctx.restore();
           }
+
+          if (hs.landmarks && hs.landmarks.length >= 21) {
+            ctx.save();
+            ctx.strokeStyle = hs.isPinched ? '#38BDF8' : 'rgba(255, 255, 255, 0.55)';
+            ctx.lineWidth = 2.5;
+            const connections = [
+              [0, 1], [1, 2], [2, 3], [3, 4],
+              [0, 5], [5, 6], [6, 7], [7, 8],
+              [0, 9], [9, 10], [10, 11], [11, 12],
+              [0, 13], [13, 14], [14, 15], [15, 16],
+              [0, 17], [17, 18], [18, 19], [19, 20],
+            ];
+            for (const [a, b] of connections) {
+              const la = hs.landmarks[a];
+              const lb = hs.landmarks[b];
+              ctx.beginPath();
+              ctx.moveTo((1 - la.x) * w, la.y * h);
+              ctx.lineTo((1 - lb.x) * w, lb.y * h);
+              ctx.stroke();
+            }
+            ctx.restore();
+          }
+
+          const hx = hs.pos.x * w;
+          const hy = hs.pos.y * h;
+          ctx.save();
+          ctx.strokeStyle = hs.isPinched ? '#F43F5E' : '#38BDF8';
+          ctx.lineWidth = hs.isPinched ? 3 : 2;
+          ctx.beginPath();
+          ctx.arc(hx, hy, hs.isPinched ? 24 : 34, 0, Math.PI * 2);
+          ctx.stroke();
+
+          ctx.fillStyle = '#FFFFFF';
+          ctx.beginPath();
+          ctx.arc(hx, hy, hs.isPinched ? 6 : 4, 0, Math.PI * 2);
+          ctx.fill();
           ctx.restore();
         }
+      }
 
-        // Draw skeletal hand landmarks if camera hand is detected
-        if (hs.landmarks && hs.landmarks.length >= 21) {
-          ctx.save();
-          ctx.strokeStyle = hs.isPinched ? 'rgba(56, 189, 248, 0.85)' : 'rgba(255, 255, 255, 0.45)';
-          ctx.lineWidth = 2;
-          const connections = [
-            [0, 1], [1, 2], [2, 3], [3, 4],
-            [0, 5], [5, 6], [6, 7], [7, 8],
-            [0, 9], [9, 10], [10, 11], [11, 12],
-            [0, 13], [13, 14], [14, 15], [15, 16],
-            [0, 17], [17, 18], [18, 19], [19, 20],
-          ];
-          for (const [a, b] of connections) {
-            const la = hs.landmarks[a];
-            const lb = hs.landmarks[b];
-            ctx.beginPath();
-            ctx.moveTo((1 - la.x) * w, la.y * h);
-            ctx.lineTo((1 - lb.x) * w, lb.y * h);
-            ctx.stroke();
-          }
-          ctx.restore();
+      if (stageRootRef.current) {
+        if (vfx.screenShakeIntensity > 0.5) {
+          const sx = (Math.random() - 0.5) * vfx.screenShakeIntensity;
+          const sy = (Math.random() - 0.5) * vfx.screenShakeIntensity;
+          stageRootRef.current.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0)`;
+        } else {
+          stageRootRef.current.style.transform = 'translate3d(0px, 0px, 0px)';
         }
-
-        // Draw Hand Tracking Reticle at smoothed hand position
-        const hx = hs.pos.x * w;
-        const hy = hs.pos.y * h;
-        ctx.save();
-        ctx.strokeStyle = hs.isPinched ? '#38BDF8' : 'rgba(255, 255, 255, 0.85)';
-        ctx.lineWidth = hs.isPinched ? 3 : 2;
-        ctx.beginPath();
-        ctx.arc(hx, hy, hs.isPinched ? 22 : 32, 0, Math.PI * 2);
-        ctx.stroke();
-
-        // Inner center point
-        ctx.fillStyle = hs.isPinched ? '#38BDF8' : '#FFFFFF';
-        ctx.beginPath();
-        ctx.arc(hx, hy, hs.isPinched ? 6 : 4, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
       }
-    }
 
-    // Update the floating captured photo orb locked to the user's hand in camera
-    const orbEl = handOrbElementRef.current;
-    if (orbEl) {
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
-      const tx = hs.pos.x * vw;
-      const ty = hs.pos.y * vh;
-      const t = computeCinematicHandTransform(phase, hs.pos, hs.velocity);
+      const orbEl = handOrbElementRef.current;
+      if (orbEl) {
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const tx = hs.pos.x * vw;
+        const ty = hs.pos.y * vh;
+        const t = computeCinematicHandTransform(phase, hs.pos, hs.velocity);
 
-      if (phase === 'GRABBING_CLOSING' || phase === 'HOLDING_IN_HAND') {
-        orbEl.style.opacity = '1';
-        orbEl.style.transform = `translate3d(${tx.toFixed(1)}px, ${ty.toFixed(1)}px, 0) translate(-50%, -50%) perspective(900px) rotateX(${t.rotateX.toFixed(1)}deg) rotateY(${t.rotateY.toFixed(1)}deg) rotateZ(${t.rotateZ.toFixed(1)}deg) scale(1)`;
-      } else if (phase === 'DELIVERING') {
-        orbEl.style.opacity = '0';
-        orbEl.style.transform = `translate3d(${(vw * 0.96).toFixed(0)}px, ${ty.toFixed(1)}px, 0) translate(-50%, -50%) scale(0.15)`;
-      } else {
-        orbEl.style.opacity = '0';
-        orbEl.style.transform = `translate3d(${tx.toFixed(1)}px, ${ty.toFixed(1)}px, 0) translate(-50%, -50%) scale(0.4)`;
+        if (phase === 'GRABBING_CLOSING' || phase === 'HOLDING_IN_HAND') {
+          orbEl.style.opacity = '1';
+          orbEl.style.transform = `translate3d(${tx.toFixed(1)}px, ${ty.toFixed(1)}px, 0) translate(-50%, -50%) perspective(900px) rotateX(${t.rotateX.toFixed(1)}deg) rotateY(${t.rotateY.toFixed(1)}deg) rotateZ(${t.rotateZ.toFixed(1)}deg) scale(1)`;
+        } else if (phase === 'DELIVERING') {
+          orbEl.style.opacity = '0';
+          orbEl.style.transform = `translate3d(${(vw * 0.98).toFixed(0)}px, ${ty.toFixed(1)}px, 0) translate(-50%, -50%) scale(0.1)`;
+        } else {
+          orbEl.style.opacity = '0';
+          orbEl.style.transform = `translate3d(${tx.toFixed(1)}px, ${ty.toFixed(1)}px, 0) translate(-50%, -50%) scale(0.3)`;
+        }
       }
-    }
-  }, []);
+
+      vfxRafIdRef.current = requestAnimationFrame(renderLoop);
+    };
+
+    vfxRafIdRef.current = requestAnimationFrame(renderLoop);
+    return () => {
+      running = false;
+      if (vfxRafIdRef.current) cancelAnimationFrame(vfxRafIdRef.current);
+    };
+  }, [screenMode]);
 
   /**
    * Processes a single hand frame (from MediaPipe camera or mouse/touch gesture)
@@ -355,13 +629,13 @@ export default function App() {
     ) => {
       const hs = handStateRef.current;
       const dt = hs.lastTimeMs > 0 ? Math.max(1, timestampMs - hs.lastTimeMs) : 16;
-      const smoothed = hs.lastTimeMs === 0 ? rawPos : smoothPoint2D(hs.pos, rawPos, 0.38);
+      const smoothed = hs.lastTimeMs === 0 ? rawPos : smoothPoint2D(hs.pos, rawPos, 0.42);
 
       const vx = (smoothed.x - hs.pos.x) / dt;
       const vy = (smoothed.y - hs.pos.y) / dt;
       const velocity = {
-        x: hs.velocity.x * 0.5 + vx * 0.5,
-        y: hs.velocity.y * 0.5 + vy * 0.5,
+        x: hs.velocity.x * 0.45 + vx * 0.55,
+        y: hs.velocity.y * 0.45 + vy * 0.55,
       };
 
       const nextPinched =
@@ -369,11 +643,10 @@ export default function App() {
           ? pinchDistOrBool
           : evaluatePinchHysteresis(hs.isPinched, pinchDistOrBool, 0.058, 0.085);
 
-      const nextTrail = [...hs.trail.filter((pt) => timestampMs - pt.t < 280), { x: smoothed.x, y: smoothed.y, t: timestampMs }];
-
-      if (nextPinched !== hs.isPinched) {
-        setHandPinching(nextPinched);
-      }
+      const nextTrail = [
+        ...hs.trail.filter((pt) => timestampMs - pt.t < 320),
+        { x: smoothed.x, y: smoothed.y, t: timestampMs },
+      ];
 
       handStateRef.current = {
         pos: smoothed,
@@ -388,47 +661,76 @@ export default function App() {
       const currentPhoto = activePhotoRef.current;
 
       if (currentPhoto) {
-        // 1. If photo is open on screen and user pinches/grabs near the photo -> collapse & close photo on screen into hand!
         if (currentPhase === 'PHOTO_OPEN' && nextPinched) {
           const nearCenterPhoto =
-            smoothed.x >= 0.14 && smoothed.x <= 0.86 && smoothed.y >= 0.14 && smoothed.y <= 0.86;
+            smoothed.x >= 0.12 && smoothed.x <= 0.88 && smoothed.y >= 0.12 && smoothed.y <= 0.88;
           if (nearCenterPhoto) {
+            const captured = snapFrameFromDesktopStreamIfActive() || currentPhoto;
+
+            if (externalPipWindowRef.current) {
+              try {
+                externalPipWindowRef.current.close();
+              } catch {}
+              externalPipWindowRef.current = null;
+              setExternalPipWindowOpen(false);
+            }
+
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            animeVfxStateRef.current = triggerAnimeGrabVfx(
+              animeVfxStateRef.current,
+              smoothed.x * vw,
+              smoothed.y * vh,
+              vw * 0.46,
+              vh * 0.48
+            );
+            sfxRef.current.playGrabImpact();
+
             stagePhaseRef.current = 'HOLDING_IN_HAND';
             setStagePhase('HOLDING_IN_HAND');
+            setAnimeActionBanner('DIMENSIONAL GRAB // PHOTO LOCKED IN HAND');
             setStatusCaption(
-              'Photo grabbed and closed on screen — move your hand toward the right edge (Phone Zone) to deliver!'
+              `Ripped "${captured.title}" off laptop screen — thrust hand toward right Phone Zone to fire!`
             );
           }
-        }
-        // 2. While holding the photo in camera hand: check if hand reaches the Phone Delivery Zone
-        else if (currentPhase === 'HOLDING_IN_HAND' || currentPhase === 'GRABBING_CLOSING') {
+        } else if (currentPhase === 'HOLDING_IN_HAND' || currentPhase === 'GRABBING_CLOSING') {
           if (isHandInPhoneDeliveryZone(smoothed, velocity)) {
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            animeVfxStateRef.current = triggerAnimeLaunchVfx(
+              animeVfxStateRef.current,
+              smoothed.x * vw,
+              smoothed.y * vh,
+              vw * 0.96,
+              smoothed.y * vh
+            );
+            sfxRef.current.playSonicLaunch();
+
             stagePhaseRef.current = 'DELIVERING';
             setStagePhase('DELIVERING');
-            setStatusCaption(`Delivering "${currentPhoto.title}" to your phone in full screen...`);
+            setAnimeActionBanner('SPATIAL FLASH // DELIVERED TO PHONE');
+            setStatusCaption(
+              `Fired "${currentPhoto.title}" over WebSocket to Phone (${activeRoomCodeRef.current || createdRoomCodeRef.current}) in Full Screen!`
+            );
             deliverPhotoToPhone(currentPhoto);
 
             setTimeout(() => {
               stagePhaseRef.current = 'DELIVERED';
               setStagePhase('DELIVERED');
-              setStatusCaption(
-                `Delivered "${currentPhoto.title}" — now open in full screen on your phone.`
-              );
+              setTimeout(() => setAnimeActionBanner(null), 1600);
             }, 340);
           } else if (!nextPinched) {
-            // Released in the middle of the screen without reaching phone -> reopen photo smoothly on screen
             stagePhaseRef.current = 'PHOTO_OPEN';
             setStagePhase('PHOTO_OPEN');
+            setAnimeActionBanner(null);
             setStatusCaption(
-              'Photo restored to screen. Pinch to grab and carry it to the right edge to send to phone.'
+              'Photo restored to laptop screen. Pinch/grab and thrust toward the right Phone edge to launch.'
             );
           }
         }
       }
-
-      renderSpatialFrame();
     },
-    [deliverPhotoToPhone, renderSpatialFrame]
+    [snapFrameFromDesktopStreamIfActive, deliverPhotoToPhone]
   );
 
   /**
@@ -451,7 +753,6 @@ export default function App() {
         await videoRef.current.play().catch(() => {});
       }
 
-      // Lazy-load MediaPipe HandLandmarker
       try {
         const vision = await import('@mediapipe/tasks-vision');
         const filesetResolver = await vision.FilesetResolver.forVisionTasks(
@@ -467,7 +768,7 @@ export default function App() {
           numHands: 1,
         });
       } catch {
-        // Pointer fallback remains active if WASM CDN is unreachable
+        // Pointer fallback remains active
       }
 
       const detectLoop = () => {
@@ -495,19 +796,18 @@ export default function App() {
             // Keep RAF loop alive
           }
         }
-        rafIdRef.current = requestAnimationFrame(detectLoop);
+        cameraRafIdRef.current = requestAnimationFrame(detectLoop);
       };
-      rafIdRef.current = requestAnimationFrame(detectLoop);
+      cameraRafIdRef.current = requestAnimationFrame(detectLoop);
     } catch {
-      // Camera permission declined or unavailable in headless browser; pointer tracking remains active
       setCameraActive(false);
     }
   }, [processSpatialHandInput]);
 
   const stopFullScreenCamera = useCallback(() => {
-    if (rafIdRef.current) {
-      cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
+    if (cameraRafIdRef.current) {
+      cancelAnimationFrame(cameraRafIdRef.current);
+      cameraRafIdRef.current = null;
     }
     if (cameraStreamRef.current) {
       cameraStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -517,9 +817,100 @@ export default function App() {
     setHandDetected(false);
   }, []);
 
-  // Automatically start full-screen camera when in Computer mode
+  const startOutOfBrowserScreenLink = async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) return;
+    try {
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: 'always' } as MediaTrackConstraints,
+        audio: false,
+      });
+      desktopStreamRef.current = stream;
+      setDesktopStreamActive(true);
+      const track = stream.getVideoTracks()[0];
+      const settings = track?.getSettings() as MediaTrackSettings & { displaySurface?: string };
+      setDesktopSurfaceName(
+        settings?.displaySurface === 'window'
+          ? 'External OS App Window'
+          : settings?.displaySurface === 'monitor'
+          ? 'Full Laptop Desktop Screen'
+          : 'Live Laptop Screen Stream'
+      );
+
+      if (desktopVideoRef.current) {
+        desktopVideoRef.current.srcObject = stream;
+        await desktopVideoRef.current.play().catch(() => {});
+      }
+
+      stagePhaseRef.current = 'PHOTO_OPEN';
+      setStagePhase('PHOTO_OPEN');
+      setStatusCaption(
+        'Linked Out-of-Browser Laptop Screen! Open any photo on your laptop, then grab in front of the camera.'
+      );
+
+      track?.addEventListener('ended', () => {
+        stopOutOfBrowserScreenLink();
+      });
+    } catch {
+      setStatusCaption(
+        'Using Floating OS Desktop Viewer Layer (Select "Link Laptop Screen" anytime to capture external OS apps).'
+      );
+    }
+  };
+
+  const stopOutOfBrowserScreenLink = () => {
+    if (desktopStreamRef.current) {
+      desktopStreamRef.current.getTracks().forEach((t) => t.stop());
+      desktopStreamRef.current = null;
+    }
+    setDesktopStreamActive(false);
+  };
+
+  const popOutFloatingOsPhotoWindow = async () => {
+    const current = activePhotoRef.current || photos[0];
+    if (!current) return;
+
+    const docPip = (
+      window as unknown as {
+        documentPictureInPicture?: {
+          requestWindow: (opts: { width: number; height: number }) => Promise<Window>;
+        };
+      }
+    ).documentPictureInPicture;
+
+    if (docPip) {
+      try {
+        const pipWin = await docPip.requestWindow({ width: 680, height: 440 });
+        externalPipWindowRef.current = pipWin;
+        setExternalPipWindowOpen(true);
+        pipWin.document.title = `${current.title} — OS Photo Viewer`;
+        pipWin.document.body.style.margin = '0';
+        pipWin.document.body.style.background = '#090D16';
+        pipWin.document.body.style.display = 'flex';
+        pipWin.document.body.style.alignItems = 'center';
+        pipWin.document.body.style.justifyContent = 'center';
+        pipWin.document.body.style.height = '100vh';
+        const img = pipWin.document.createElement('img');
+        img.src = current.dataUrl;
+        img.style.width = '100%';
+        img.style.height = '100%';
+        img.style.objectFit = 'contain';
+        pipWin.document.body.appendChild(img);
+
+        pipWin.addEventListener('pagehide', () => {
+          externalPipWindowRef.current = null;
+          setExternalPipWindowOpen(false);
+        });
+        return;
+      } catch {
+        // Fallback below
+      }
+    }
+    stagePhaseRef.current = 'PHOTO_OPEN';
+    setStagePhase('PHOTO_OPEN');
+  };
+
   useEffect(() => {
-    if (deviceRole === 'computer') {
+    if (screenMode === 'creator-stage') {
       startFullScreenCamera();
     } else {
       stopFullScreenCamera();
@@ -527,46 +918,30 @@ export default function App() {
     return () => {
       stopFullScreenCamera();
     };
-  }, [deviceRole, startFullScreenCamera, stopFullScreenCamera]);
+  }, [screenMode, startFullScreenCamera, stopFullScreenCamera]);
 
-  // Keep canvas sized to viewport
-  useEffect(() => {
-    const syncCanvasSize = () => {
-      if (overlayCanvasRef.current) {
-        overlayCanvasRef.current.width = window.innerWidth;
-        overlayCanvasRef.current.height = window.innerHeight;
-        renderSpatialFrame();
-      }
-    };
-    syncCanvasSize();
-    window.addEventListener('resize', syncCanvasSize);
-    return () => window.removeEventListener('resize', syncCanvasSize);
-  }, [renderSpatialFrame]);
-
-  /**
-   * Simulates / executes the full cinematic Grab -> Close on Screen -> Carry to Phone -> Deliver animation
-   * when triggered by click or assistive button
-   */
-  const triggerCinematicGrabAndToss = useCallback(() => {
+  const triggerAnimeGrabAndLaunch = useCallback(() => {
     const photo = activePhotoRef.current || photos[0];
     if (!photo) return;
     if (!activePhotoRef.current) {
       setActivePhoto(photo);
       activePhotoRef.current = photo;
     }
+    if (stagePhaseRef.current !== 'PHOTO_OPEN') {
+      stagePhaseRef.current = 'PHOTO_OPEN';
+      setStagePhase('PHOTO_OPEN');
+    }
 
     const now = performance.now();
-    // Step 1: Hand grabs at center -> photo collapses into camera hand & closes on screen
-    processSpatialHandInput({ x: 0.5, y: 0.5 }, true, now);
-
-    // Step 2: Animate hand carrying the collapsed photo orb toward the right Phone edge
-    setTimeout(() => {
-      processSpatialHandInput({ x: 0.68, y: 0.46 }, true, performance.now());
-    }, 180);
+    processSpatialHandInput({ x: 0.46, y: 0.48 }, true, now);
 
     setTimeout(() => {
-      processSpatialHandInput({ x: 0.88, y: 0.44 }, true, performance.now());
-    }, 360);
+      processSpatialHandInput({ x: 0.64, y: 0.45 }, true, performance.now());
+    }, 240);
+
+    setTimeout(() => {
+      processSpatialHandInput({ x: 0.88, y: 0.42 }, true, performance.now());
+    }, 520);
   }, [photos, processSpatialHandInput]);
 
   const handleOpenCustomPhoto = (files: FileList | null) => {
@@ -577,46 +952,23 @@ export default function App() {
       if (typeof reader.result === 'string') {
         const newItem: SpatialPhotoItem = {
           id: `custom-${Date.now()}`,
-          title: file.name.replace(/\.[^.]+$/, ''),
-          subtitle: `${Math.round(file.size / 1024)} KB · Local Photo`,
+          title: file.name,
+          subtitle: `Out-of-Browser Desktop Layer · ${Math.round(file.size / 1024)} KB`,
           dataUrl: reader.result,
         };
         setPhotos((prev) => [newItem, ...prev]);
         setActivePhoto(newItem);
+        activePhotoRef.current = newItem;
         stagePhaseRef.current = 'PHOTO_OPEN';
         setStagePhase('PHOTO_OPEN');
-        setStatusCaption(`Opened "${newItem.title}" — pinch or grab with your hand to toss to phone.`);
+        setStatusCaption(
+          `Opened "${newItem.title}" on laptop screen — pinch/grab with your hand for Anime Spatial Toss!`
+        );
       }
     };
     reader.readAsDataURL(file);
   };
 
-  const handleConnectPhoneByCode = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleaned = normalizeRoomCode(phoneCodeInput);
-    if (cleaned.length !== 4) return;
-    setRoomCode(cleaned);
-    setDeviceRole('phone');
-    setPhoneConnected(true);
-    setShowCodeModal(false);
-
-    try {
-      const res = await fetch(`/api/rooms/${cleaned}/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role: 'phone' }),
-      });
-      const data = await res.json();
-      if (data?.latestPhoto) {
-        setDeliveredPhoto(data.latestPhoto);
-        setPhoneFullScreenOpen(true);
-      }
-    } catch {
-      // Offline/local fallback handled via BroadcastChannel
-    }
-  };
-
-  // Pointer handlers on the full-screen camera stage (mouse & touch hand simulation)
   const handleStagePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const x = Math.max(0, Math.min(1, e.clientX / window.innerWidth));
     const y = Math.max(0, Math.min(1, e.clientY / window.innerHeight));
@@ -637,38 +989,242 @@ export default function App() {
   };
 
   // ============================================================================
-  // PHONE RECEIVER VIEW (Ultra-clean 4-digit code connect -> Full-screen photo)
+  // 1. LANDING PAGE: CREATE ROOM vs JOIN ROOM (Browser-Only Room Storage over WebSocket)
   // ============================================================================
-  if (deviceRole === 'phone') {
+  if (screenMode === 'landing') {
+    return (
+      <div
+        data-testid="landing-room-screen"
+        className="min-h-screen bg-[#090D16] text-white flex flex-col justify-between select-none"
+      >
+        {/* Minimal 3-Zone Top Bar */}
+        <header className="flex items-center justify-between gap-8 px-6 md:px-10 py-4 border-b border-white/10">
+          <a
+            href="#top"
+            onClick={(e) => e.preventDefault()}
+            className="text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
+          >
+            Toss
+          </a>
+          <div className="flex items-center gap-4 text-xs font-mono text-slate-400">
+            <span>WebSocket Relay: {wsConnected ? 'CONNECTED' : 'CONNECTING'}</span>
+            <span aria-hidden="true">·</span>
+            <span>Storage: Browser Tab Only (Zero Server Storage)</span>
+          </div>
+          <div className="flex items-center shrink-0">
+            <button
+              type="button"
+              onClick={handleCreateRoom}
+              className="min-h-[40px] px-4 py-2 bg-white text-slate-950 text-xs font-bold rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              Create Room
+            </button>
+          </div>
+        </header>
+
+        <main className="flex-1 max-w-5xl w-full mx-auto px-6 py-10 flex flex-col justify-center space-y-8">
+          <div className="max-w-2xl space-y-2">
+            <div className="text-xs font-mono font-bold text-sky-400 tracking-widest">
+              SPATIAL HAND GRAB · EPHEMERAL WEBSOCKET ROOMS
+            </div>
+            <h1 className="text-3xl md:text-4xl font-bold tracking-tight text-white">
+              Create a room on your laptop. Join with the code on your phone.
+            </h1>
+            <p className="text-sm text-slate-400">
+              Rooms live strictly inside your browser tab via sessionStorage and stream directly over WebSocket. As soon as you close the tab, the room is destroyed.
+            </p>
+          </div>
+
+          {roomError && (
+            <div
+              role="alert"
+              className="bg-rose-950/60 border border-rose-500/60 rounded-xl px-4 py-3 text-xs font-mono text-rose-200 flex items-center justify-between gap-4"
+            >
+              <span>{roomError}</span>
+              <button
+                type="button"
+                onClick={() => setRoomError(null)}
+                className="px-2.5 py-1 bg-white/10 rounded text-white font-semibold cursor-pointer"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
+          {/* Two-Column Create Room / Join Room Grid */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-stretch">
+            {/* Column 1: Create Room (Laptop Host) */}
+            <section
+              aria-labelledby="create-room-heading"
+              className="bg-[#0F172A] border border-white/15 rounded-xl p-6 flex flex-col justify-between space-y-6"
+            >
+              <div className="space-y-3">
+                <div className="text-xs font-mono text-sky-400">01 · LAPTOP / CAMERA HOST</div>
+                <h2 id="create-room-heading" className="text-xl font-bold text-white">
+                  Create Room
+                </h2>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Generate a 4-digit room code stored only in this browser tab. Once connected, open any photo on your laptop screen, grab it with your hand in front of the camera, and fire it to your phone.
+                </p>
+
+                {createdRoomCode ? (
+                  <div className="pt-2 space-y-4">
+                    <div className="p-4 bg-[#090D16] border border-sky-400/50 rounded-xl text-center space-y-2">
+                      <div className="text-[11px] font-mono text-slate-400">
+                        SHARE THIS 4-DIGIT ROOM CODE WITH YOUR PHONE
+                      </div>
+                      <div
+                        data-testid="created-room-code-display"
+                        className="text-4xl font-mono font-bold tracking-[0.35em] text-white tabular-nums"
+                      >
+                        {createdRoomCode}
+                      </div>
+                      <div className="text-[11px] font-mono text-emerald-400">
+                        {peerConnected
+                          ? 'Second device joined! Ready for Spatial Toss'
+                          : 'Waiting for second device to join via code...'}
+                      </div>
+                    </div>
+
+                    {qrSvg && (
+                      <div className="flex items-center gap-4 bg-[#090D16] border border-white/10 rounded-xl p-3">
+                        <div
+                          className="w-20 h-20 bg-white p-1.5 rounded-lg shrink-0 [&>svg]:w-full [&>svg]:h-full"
+                          dangerouslySetInnerHTML={{ __html: qrSvg }}
+                        />
+                        <div className="text-xs text-slate-300 space-y-1">
+                          <div className="font-semibold text-white">Instant QR Join</div>
+                          <p className="text-[11px] text-slate-400">
+                            Scan with your phone camera to prefill code <strong className="text-white font-mono">{createdRoomCode}</strong>.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="p-6 bg-[#090D16] border border-white/10 rounded-xl text-center text-xs text-slate-400">
+                    Click &ldquo;Create Room&rdquo; below to generate a browser-stored 4-digit room code.
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 pt-2">
+                {!createdRoomCode ? (
+                  <button
+                    type="button"
+                    onClick={handleCreateRoom}
+                    className="w-full min-h-[48px] px-5 py-3 bg-white text-slate-950 text-sm font-bold rounded-lg hover:bg-slate-200 transition-colors cursor-pointer"
+                  >
+                    Create Room
+                  </button>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveRoomCode(createdRoomCode);
+                        setScreenMode('creator-stage');
+                      }}
+                      className="flex-1 min-h-[48px] px-5 py-3 bg-white text-slate-950 text-xs font-bold rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap cursor-pointer"
+                    >
+                      Open Full-Screen Camera Stage
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleDestroyRoomNow}
+                      className="min-h-[48px] px-4 py-3 bg-rose-950/80 border border-rose-500/50 text-rose-200 text-xs font-semibold rounded-lg hover:bg-rose-900/80 whitespace-nowrap cursor-pointer"
+                    >
+                      Destroy Room
+                    </button>
+                  </>
+                )}
+              </div>
+            </section>
+
+            {/* Column 2: Join Room (Phone Receiver) */}
+            <section
+              aria-labelledby="join-room-heading"
+              className="bg-[#0F172A] border border-white/15 rounded-xl p-6 flex flex-col justify-between space-y-6"
+            >
+              <div className="space-y-3">
+                <div className="text-xs font-mono text-emerald-400">02 · PHONE / RECEIVER DEVICE</div>
+                <h2 id="join-room-heading" className="text-xl font-bold text-white">
+                  Join Room
+                </h2>
+                <p className="text-xs text-slate-400 leading-relaxed">
+                  Enter the 4-digit code shown on the host device. When the host grabs a photo and thrusts it toward your phone, it automatically opens in full screen.
+                </p>
+
+                <form id="join-room-form" onSubmit={handleJoinRoomSubmit} className="pt-2 space-y-4">
+                  <div className="space-y-1.5">
+                    <label htmlFor="join-room-code-input" className="block text-xs font-semibold text-slate-300">
+                      Enter 4-Digit Room Code
+                    </label>
+                    <input
+                      id="join-room-code-input"
+                      type="text"
+                      inputMode="numeric"
+                      maxLength={4}
+                      value={joinCodeInput}
+                      onChange={(e) => setJoinCodeInput(normalizeRoomCode(e.target.value))}
+                      placeholder="0000"
+                      className="w-full min-h-[56px] px-4 py-3 text-center text-3xl font-mono font-bold tracking-[0.35em] bg-[#090D16] border border-white/20 rounded-xl text-white focus:outline-2 focus:outline-sky-400 tabular-nums"
+                    />
+                  </div>
+                </form>
+              </div>
+
+              <button
+                type="submit"
+                form="join-room-form"
+                className="w-full min-h-[48px] px-5 py-3 bg-sky-400 text-slate-950 text-sm font-bold rounded-lg hover:bg-sky-300 transition-colors cursor-pointer"
+              >
+                Join Room with Code
+              </button>
+            </section>
+          </div>
+        </main>
+
+        <footer className="px-6 md:px-10 py-4 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-400">
+          <span>Ephemeral Browser-Saved Room Architecture · WebSocket Direct Stream</span>
+          <span className="font-mono">Closing the host tab immediately destroys the room</span>
+        </footer>
+      </div>
+    );
+  }
+
+  // ============================================================================
+  // 2. JOINER PHONE RECEIVER VIEW (Connected via 4-Digit Room Code -> Opens Full Screen)
+  // ============================================================================
+  if (screenMode === 'joiner-phone') {
+    const displayCode = activeRoomCode || joinCodeInput || createdRoomCode;
     return (
       <div
         data-testid="phone-receiver-screen"
         className="fixed inset-0 bg-[#090D16] text-[#F8FAFC] flex flex-col justify-between select-none overflow-hidden"
       >
-        {/* Minimal Top Bar */}
         <header className="relative z-20 flex items-center justify-between gap-8 px-6 py-4 border-b border-white/10 bg-[#090D16]/90">
           <span className="text-base font-bold tracking-tight text-white whitespace-nowrap shrink-0">
-            Toss · Phone
+            Toss · Phone Receiver
           </span>
           <div className="flex items-center gap-4 text-xs text-slate-300 font-mono tabular-nums">
-            <span>Code: {roomCode}</span>
+            <span>Room: {displayCode}</span>
             <span aria-hidden="true">·</span>
-            <span className="text-emerald-400 font-semibold">Connected</span>
+            <span className="text-emerald-400 font-semibold">WebSocket Live</span>
           </div>
           <button
             type="button"
-            onClick={() => setDeviceRole('computer')}
+            onClick={() => setScreenMode('landing')}
             className="min-h-[40px] px-3.5 py-1.5 text-xs font-semibold text-white bg-white/10 border border-white/15 rounded-lg hover:bg-white/15 whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Switch to Computer
+            Leave Room
           </button>
         </header>
 
-        {/* Full-Screen Delivered Photo View on Phone */}
         {deliveredPhoto && phoneFullScreenOpen ? (
           <main
             data-testid="phone-fullscreen-photo-viewer"
-            className="fixed inset-0 z-30 bg-black flex flex-col justify-between animate-fadeIn"
+            className="fixed inset-0 z-30 bg-black flex flex-col justify-between"
           >
             <img
               src={deliveredPhoto.dataUrl}
@@ -677,18 +1233,18 @@ export default function App() {
               className="w-full h-full object-contain"
             />
 
-            <div className="absolute inset-x-0 bottom-0 p-6 bg-black/75 border-t border-white/10 flex items-center justify-between gap-4">
+            <div className="absolute inset-x-0 bottom-0 p-6 bg-black/80 border-t border-sky-400/40 flex items-center justify-between gap-4">
               <div>
+                <div className="text-[11px] font-mono text-sky-400 font-bold tracking-wider">
+                  SPATIAL IMPACT // FULL-SCREEN DELIVERY (ROOM {displayCode})
+                </div>
                 <h1 className="text-base font-bold text-white">{deliveredPhoto.title}</h1>
-                <p className="text-xs text-emerald-400 font-mono tabular-nums">
-                  Delivered from Computer · Full-Screen View
-                </p>
               </div>
               <div className="flex items-center gap-2.5">
                 <a
                   href={deliveredPhoto.dataUrl}
                   download={`${deliveredPhoto.title}.jpg`}
-                  className="min-h-[44px] px-4 py-2.5 bg-white text-slate-950 text-xs font-semibold rounded-lg flex items-center justify-center whitespace-nowrap shrink-0"
+                  className="min-h-[44px] px-4 py-2.5 bg-white text-slate-950 text-xs font-bold rounded-lg flex items-center justify-center whitespace-nowrap shrink-0"
                 >
                   Save Photo
                 </a>
@@ -703,53 +1259,18 @@ export default function App() {
             </div>
           </main>
         ) : (
-          /* Phone Standby / Code Entry View */
-          <main className="flex-1 flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto w-full space-y-8">
+          <main className="flex-1 flex flex-col items-center justify-center p-6 text-center max-w-md mx-auto w-full space-y-6">
             <div className="space-y-2">
               <p className="text-xs font-mono text-sky-400 tracking-wide">
-                PHONE RECEIVER READY · CODE {roomCode}
+                JOINED ROOM {displayCode} · WAITING FOR ANIME TOSS
               </p>
               <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white">
-                Waiting for Hand Toss
+                Phone Connected to Room {displayCode}
               </h1>
               <p className="text-sm text-slate-400">
-                Open any photo on your computer, grab it with your hand in front of the camera, and move your hand toward this phone. It will open here in full screen automatically.
+                Open any photo on the host laptop screen, grab it in front of the camera, and thrust your hand toward this phone—it will slam open in full screen here automatically.
               </p>
             </div>
-
-            <form onSubmit={handleConnectPhoneByCode} className="w-full space-y-3 bg-white/5 border border-white/10 rounded-xl p-5">
-              <label htmlFor="phone-room-code-input" className="block text-xs font-semibold text-slate-300">
-                Paired 4-Digit Computer Code
-              </label>
-              <div className="flex items-center gap-2">
-                <input
-                  id="phone-room-code-input"
-                  type="text"
-                  inputMode="numeric"
-                  maxLength={4}
-                  value={phoneCodeInput}
-                  onChange={(e) => setPhoneCodeInput(normalizeRoomCode(e.target.value))}
-                  className="flex-1 min-h-[48px] px-4 py-2 text-center text-2xl font-mono font-bold tracking-widest bg-[#090D16] border border-white/20 rounded-lg text-white"
-                  placeholder="4829"
-                />
-                <button
-                  type="submit"
-                  className="min-h-[48px] px-5 py-2 bg-white text-slate-950 text-xs font-bold rounded-lg hover:bg-slate-200 whitespace-nowrap shrink-0 cursor-pointer"
-                >
-                  Sync Code
-                </button>
-              </div>
-            </form>
-
-            {deliveredPhoto && (
-              <button
-                type="button"
-                onClick={() => setPhoneFullScreenOpen(true)}
-                className="min-h-[44px] px-5 py-2.5 bg-white/10 border border-white/20 rounded-lg text-xs font-semibold text-white hover:bg-white/15 cursor-pointer"
-              >
-                Re-Open Last Delivered Photo ({deliveredPhoto.title})
-              </button>
-            )}
           </main>
         )}
       </div>
@@ -757,14 +1278,16 @@ export default function App() {
   }
 
   // ============================================================================
-  // COMPUTER FULL-SCREEN CAMERA & HAND TOSS STAGE
+  // 3. CREATOR STAGE: FULL-SCREEN CAMERA + OUT-OF-BROWSER OS PHOTO + ANIME ACTION VFX
   // ============================================================================
+  const currentRoomCode = createdRoomCode || activeRoomCode || '4829';
   const photoIsOpenOnScreen = activePhoto !== null && stagePhase === 'PHOTO_OPEN';
   const photoIsHeldInHand =
     activePhoto !== null && (stagePhase === 'HOLDING_IN_HAND' || stagePhase === 'GRABBING_CLOSING');
 
   return (
     <div
+      ref={stageRootRef}
       data-testid="computer-camera-stage"
       data-stage-phase={stagePhase}
       onDragOver={(e) => e.preventDefault()}
@@ -784,10 +1307,13 @@ export default function App() {
         }`}
       />
 
-      {/* 2. FULL-SCREEN INTERACTIVE HAND TRACKING CANVAS OVERLAY */}
+      {/* Hidden video element holding the live Out-of-Browser getDisplayMedia OS screen stream */}
+      <video ref={desktopVideoRef} muted playsInline className="hidden" />
+
+      {/* 2. FULL-SCREEN 60FPS ANIME ACTION VFX CANVAS */}
       <canvas
         ref={overlayCanvasRef}
-        className="fixed inset-0 w-full h-full pointer-events-none z-10"
+        className="fixed inset-0 w-full h-full pointer-events-none z-20"
       />
 
       {/* 3. POINTER / HAND GESTURE INTERACTION SURFACE */}
@@ -799,52 +1325,61 @@ export default function App() {
       />
 
       {/* 4. ULTRA-CLEAN TOP BAR (Strictly 3 zones separated by gap-8) */}
-      <header className="relative z-30 flex items-center justify-between gap-8 px-6 py-4 border-b border-white/10 bg-[#090D16]/80">
-        {/* Zone 1: Brand Wordmark */}
+      <header className="relative z-30 flex items-center justify-between gap-8 px-6 py-3.5 border-b border-white/10 bg-[#090D16]/85">
         <a
           href="#top"
           onClick={(e) => {
             e.preventDefault();
-            setShowCodeModal(false);
+            setScreenMode('landing');
           }}
           className="text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0"
         >
           Toss
         </a>
 
-        {/* Zone 2: Minimal Single-Line Navigation Links */}
         <nav aria-label="Workspace Controls" className="flex items-center gap-6 text-sm font-medium text-slate-300 overflow-x-auto">
           <button
             type="button"
             onClick={() => setShowCodeModal(true)}
             className="hover:text-white transition-colors whitespace-nowrap shrink-0 font-mono tabular-nums cursor-pointer"
           >
-            Phone Code: <strong className="text-white">{roomCode}</strong>
+            Room Code: <strong className="text-white">{currentRoomCode}</strong>{' '}
+            <span className="text-emerald-400">({peerConnected ? 'Peer Joined' : 'Waiting'})</span>
           </button>
           <button
             type="button"
-            onClick={() => setDeviceRole('phone')}
+            onClick={desktopStreamActive ? stopOutOfBrowserScreenLink : startOutOfBrowserScreenLink}
             className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Phone View
+            {desktopStreamActive ? `Linked: ${desktopSurfaceName}` : 'Link Laptop Screen (Out-of-Browser)'}
           </button>
           <button
             type="button"
-            onClick={() => setShowPipPhonePreview((v) => !v)}
+            onClick={popOutFloatingOsPhotoWindow}
             className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            {showPipPhonePreview ? 'Hide Phone Preview' : 'Show Phone Preview'}
+            {externalPipWindowOpen ? 'OS Window Active' : 'Pop Out OS Window'}
           </button>
           <button
             type="button"
-            onClick={cameraActive ? stopFullScreenCamera : startFullScreenCamera}
+            onClick={handleDestroyRoomNow}
+            className="text-rose-400 hover:text-rose-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          >
+            Destroy Room
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const next = !sfxMuted;
+              setSfxMuted(next);
+              sfxRef.current.muted = next;
+            }}
             className="hover:text-white transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            {cameraActive ? 'Camera Active' : 'Start Camera'}
+            {sfxMuted ? 'SFX: Muted' : 'SFX: Anime Audio'}
           </button>
         </nav>
 
-        {/* Zone 3: 1 Primary Action (Open Any Photo from Computer) */}
         <div className="flex items-center shrink-0">
           <input
             ref={fileInputRef}
@@ -866,123 +1401,146 @@ export default function App() {
         </div>
       </header>
 
-      {/* 5. CENTER STAGE: OPEN PHOTO ON SCREEN (Collapses & closes into hand when grabbed!) */}
-      <main className="relative z-20 flex-1 flex items-center justify-center p-6 pointer-events-none">
+      {/* ANIME ACTION CALLOUT BANNER */}
+      {animeActionBanner && (
+        <div
+          data-testid="anime-action-callout"
+          className="fixed top-20 left-1/2 -translate-x-1/2 z-40 pointer-events-none px-5 py-2 bg-[#090D16] border-2 border-sky-400 rounded-lg text-xs font-mono font-bold tracking-widest text-sky-300 whitespace-nowrap"
+        >
+          {animeActionBanner}
+        </div>
+      )}
+
+      {/* 5. CENTER STAGE: FLOATING OUT-OF-BROWSER OS DESKTOP PHOTO VIEWER WINDOW */}
+      <main className="relative z-15 flex-1 flex items-center justify-center p-6 pointer-events-none">
         {activePhoto && (
           <div
-            ref={photoStageElementRef}
             data-testid="screen-open-photo"
-            className={`relative max-w-3xl w-full transition-all duration-300 ease-out ${
+            className={`relative max-w-3xl w-full transition-all duration-200 ease-out ${
               photoIsOpenOnScreen
-                ? 'opacity-100 scale-100 translate-x-0'
-                : stagePhase === 'HOLDING_IN_HAND' || stagePhase === 'GRABBING_CLOSING'
-                ? 'opacity-0 scale-[0.18] pointer-events-none'
-                : 'opacity-0 scale-50 translate-x-48 pointer-events-none'
+                ? 'opacity-100 scale-100'
+                : 'opacity-0 scale-0 pointer-events-none'
             }`}
           >
-            <div className="bg-[#0F172A] border border-white/15 rounded-xl overflow-hidden">
-              <div className="px-4 py-2.5 border-b border-white/10 flex items-center justify-between text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold text-white">{activePhoto.title}</span>
+            <div className="bg-[#111827] border-2 border-white/25 rounded-xl overflow-hidden">
+              <div className="px-4 py-2.5 bg-[#090D16] border-b border-white/15 flex items-center justify-between text-xs">
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-1.5" aria-hidden="true">
+                    <span className="w-3 h-3 rounded-sm bg-rose-500 inline-block" />
+                    <span className="w-3 h-3 rounded-sm bg-amber-400 inline-block" />
+                    <span className="w-3 h-3 rounded-sm bg-emerald-500 inline-block" />
+                  </div>
+                  <span className="font-mono font-bold text-white">{activePhoto.title}</span>
                   <span aria-hidden="true" className="text-slate-500">·</span>
-                  <span className="text-slate-400 font-mono">{activePhoto.subtitle}</span>
+                  <span className="text-slate-400 font-mono text-[11px]">
+                    {desktopStreamActive
+                      ? `Live Desktop Capture (${desktopSurfaceName})`
+                      : 'OS Desktop Photo Viewer (Out-of-Browser Layer)'}
+                  </span>
                 </div>
-                <span className="text-sky-400 font-mono">
-                  {handDetected ? 'Hand Tracking Active · Pinch to Grab' : 'Pinch or Drag Photo Toward Phone ->'}
+                <span className="text-sky-400 font-mono font-semibold text-[11px]">
+                  {handDetected ? 'HAND LOCKED · PINCH TO SHATTER & GRAB' : 'PINCH / GRAB TO RIP OUT OF SCREEN'}
                 </span>
               </div>
 
               <div className="relative aspect-video bg-black overflow-hidden">
-                <img
-                  src={activePhoto.dataUrl}
-                  alt={activePhoto.title}
-                  referrerPolicy="no-referrer"
-                  className="w-full h-full object-cover"
-                />
+                {desktopStreamActive ? (
+                  <DesktopStreamMirrorCanvas videoRef={desktopVideoRef} />
+                ) : (
+                  <img
+                    src={activePhoto.dataUrl}
+                    alt={activePhoto.title}
+                    referrerPolicy="no-referrer"
+                    className="w-full h-full object-cover"
+                  />
+                )}
               </div>
             </div>
           </div>
         )}
 
-        {/* State Banner when Photo has been Closed & Delivered to Phone */}
         {stagePhase === 'DELIVERED' && activePhoto && (
           <div
             data-testid="photo-closed-delivered-state"
-            className="pointer-events-auto bg-[#0F172A]/90 border border-white/15 rounded-xl p-6 max-w-md text-center space-y-4"
+            className="pointer-events-auto bg-[#0F172A]/95 border-2 border-sky-400/60 rounded-xl p-6 max-w-md text-center space-y-4"
           >
-            <div className="text-xs font-mono text-emerald-400">
-              CLOSED ON SCREEN · DELIVERED TO PHONE ({roomCode})
+            <div className="text-xs font-mono font-bold text-sky-400 tracking-wider">
+              OS PHOTO WINDOW CLOSED · DELIVERED TO ROOM ({currentRoomCode})
             </div>
             <h2 className="text-xl font-bold text-white">
-              {activePhoto.title} is now open on your phone
+              {activePhoto.title} slammed open on your phone
             </h2>
             <p className="text-xs text-slate-300">
-              Select another photo from the bottom bar or re-open to grab and toss again.
+              Streamed directly over WebSocket. Close this browser tab at any time to immediately destroy Room {currentRoomCode}.
             </p>
             <button
               type="button"
               onClick={() => {
                 stagePhaseRef.current = 'PHOTO_OPEN';
                 setStagePhase('PHOTO_OPEN');
-                setStatusCaption('Photo reopened on screen. Pinch or grab to toss to your phone.');
+                setStatusCaption('OS Photo Window restored on laptop screen — grab with your hand to launch again.');
               }}
               className="min-h-[44px] px-5 py-2.5 bg-white text-slate-950 text-xs font-bold rounded-lg hover:bg-slate-200 cursor-pointer"
             >
-              Reopen Photo on Computer
+              Reopen Photo on Laptop Screen
             </button>
           </div>
         )}
       </main>
 
-      {/* 6. CINEMATIC FLOATING PHOTO CAPSULE LOCKED IN CAMERA HAND WHEN GRABBED */}
+      {/* 6. ANIME ENERGY SPHERE + CAPTURED PHOTO LOCKED IN CAMERA HAND WHEN GRABBED */}
       <div
         ref={handOrbElementRef}
         data-testid="camera-hand-grabbed-orb"
         style={{ opacity: photoIsHeldInHand ? 1 : 0 }}
-        className="fixed top-0 left-0 z-30 pointer-events-none w-52 transition-opacity duration-150"
+        className="fixed top-0 left-0 z-30 pointer-events-none w-56 transition-opacity duration-75"
       >
         {activePhoto && (
-          <div className="bg-[#0F172A] border-2 border-sky-400 rounded-xl overflow-hidden p-1.5">
+          <div className="bg-[#090D16] border-2 border-rose-500 rounded-xl overflow-hidden p-1.5">
             <img
               src={activePhoto.dataUrl}
               alt={activePhoto.title}
               referrerPolicy="no-referrer"
-              className="w-full h-28 object-cover rounded-lg"
+              className="w-full h-28 object-cover rounded-lg border border-sky-400"
             />
             <div className="px-2 py-1 text-[11px] font-mono text-sky-300 flex items-center justify-between">
-              <span className="truncate">{activePhoto.title}</span>
-              <span className="shrink-0 font-bold">IN HAND -&gt;</span>
+              <span className="truncate font-bold">{activePhoto.title}</span>
+              <span className="shrink-0 text-rose-400 font-bold">ANIME LOCK -&gt;</span>
             </div>
           </div>
         )}
       </div>
 
-      {/* 7. RIGHT-EDGE PHONE DELIVERY BEACON */}
+      {/* 7. RIGHT-EDGE PHONE DELIVERY WARP GATE */}
       <div
         aria-hidden="true"
-        className={`fixed top-20 bottom-24 right-3 z-20 w-10 rounded-lg border flex items-center justify-center pointer-events-none transition-colors ${
+        className={`fixed top-20 bottom-24 right-3 z-20 w-10 rounded-lg border-2 flex items-center justify-center pointer-events-none transition-colors ${
           photoIsHeldInHand
-            ? 'border-emerald-400 bg-emerald-950/50 text-emerald-300'
-            : 'border-white/10 bg-white/5 text-slate-400'
+            ? 'border-sky-400 bg-sky-950/60 text-white'
+            : 'border-white/15 bg-white/5 text-slate-400'
         }`}
       >
-        <span className="[writing-mode:vertical-rl] text-[11px] font-mono font-semibold tracking-widest whitespace-nowrap">
-          PHONE DELIVERY ZONE · CODE {roomCode}
+        <span className="[writing-mode:vertical-rl] text-[11px] font-mono font-bold tracking-widest whitespace-nowrap">
+          PHONE WARP GATE · ROOM {currentRoomCode}
         </span>
       </div>
 
-      {/* 8. LIVE PHONE SCREEN PREVIEW WINDOW (Shows the Phone opening the delivered photo in Full Screen!) */}
+      {/* 8. LIVE PHONE SCREEN PREVIEW WINDOW */}
       {showPipPhonePreview && (
         <aside
           aria-label="Connected Phone Live Screen"
           data-testid="live-phone-preview-window"
-          className="fixed bottom-24 right-16 z-30 w-56 sm:w-64 aspect-[9/16] bg-[#090D16] border-2 border-white/20 rounded-xl overflow-hidden flex flex-col justify-between"
+          className="fixed bottom-24 right-16 z-30 w-56 sm:w-64 aspect-[9/16] bg-[#090D16] border-2 border-white/25 rounded-xl overflow-hidden flex flex-col justify-between"
         >
-          <div className="px-3 py-2 bg-black/80 border-b border-white/10 flex items-center justify-between text-[11px] font-mono">
-            <span className="text-white font-semibold">Phone ({roomCode})</span>
-            <span className="text-emerald-400">
-              {deliveredPhoto ? 'FULL SCREEN' : phoneConnected ? 'Paired' : 'Ready'}
-            </span>
+          <div className="px-3 py-2 bg-black/90 border-b border-white/15 flex items-center justify-between text-[11px] font-mono">
+            <span className="text-white font-bold">Phone (Room {currentRoomCode})</span>
+            <button
+              type="button"
+              onClick={() => setShowPipPhonePreview(false)}
+              className="text-slate-400 hover:text-white cursor-pointer"
+            >
+              Hide
+            </button>
           </div>
 
           {deliveredPhoto ? (
@@ -993,18 +1551,18 @@ export default function App() {
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-cover"
               />
-              <div className="absolute inset-x-0 bottom-0 p-2.5 bg-black/80 border-t border-white/10 flex items-center justify-between gap-2">
+              <div className="absolute inset-x-0 bottom-0 p-2.5 bg-black/85 border-t border-sky-400/40 flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="text-[11px] font-bold text-white truncate">
                     {deliveredPhoto.title}
                   </div>
-                  <div className="text-[10px] font-mono text-emerald-400">
-                    Opened Full Screen
+                  <div className="text-[10px] font-mono text-sky-400 font-bold">
+                    FULL-SCREEN IMPACT
                   </div>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setDeviceRole('phone')}
+                  onClick={() => setScreenMode('joiner-phone')}
                   className="px-2 py-1 bg-white text-slate-950 text-[10px] font-bold rounded shrink-0 cursor-pointer"
                 >
                   Expand
@@ -1013,18 +1571,17 @@ export default function App() {
             </div>
           ) : (
             <div className="flex-1 p-4 flex flex-col items-center justify-center text-center space-y-2">
-              <div className="text-xs font-semibold text-white">Phone Screen Standby</div>
+              <div className="text-xs font-bold text-white">Phone Standby</div>
               <p className="text-[11px] text-slate-400 leading-relaxed">
-                Grab the open photo on your screen and move your hand to the right edge—it will open here and on your phone in full screen.
+                Grab the photo on your laptop screen—watch it shatter into your hand and slam into full screen here.
               </p>
             </div>
           )}
         </aside>
       )}
 
-      {/* 9. ULTRA-CLEAN BOTTOM DOCK: PHOTO SELECTOR + ONE-CLICK GRAB & TOSS */}
-      <footer className="relative z-30 px-6 py-3.5 bg-[#090D16]/85 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-4">
-        {/* Left: Photo Thumbnails */}
+      {/* 9. BOTTOM DOCK: PHOTO SELECTOR + ANIME GRAB & LAUNCH TRIGGER */}
+      <footer className="relative z-30 px-6 py-3.5 bg-[#090D16]/90 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-4">
         <div className="flex items-center gap-2.5 overflow-x-auto max-w-full">
           {photos.map((item) => {
             const isSelected = activePhoto?.id === item.id && stagePhase === 'PHOTO_OPEN';
@@ -1034,11 +1591,12 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   setActivePhoto(item);
+                  activePhotoRef.current = item;
                   stagePhaseRef.current = 'PHOTO_OPEN';
                   setStagePhase('PHOTO_OPEN');
-                  setStatusCaption(`Opened "${item.title}" — pinch or grab with your hand to toss to phone.`);
+                  setStatusCaption(`Opened "${item.title}" in OS Desktop Layer — grab with your hand!`);
                 }}
-                className={`group flex items-center gap-2.5 p-1.5 pr-3 rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                className={`flex items-center gap-2.5 p-1.5 pr-3 rounded-lg border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   isSelected
                     ? 'bg-white text-slate-950 border-white'
                     : 'bg-white/5 text-slate-200 border-white/10 hover:border-white/30'
@@ -1056,7 +1614,6 @@ export default function App() {
           })}
         </div>
 
-        {/* Center Status Caption */}
         <div
           data-testid="spatial-stage-status"
           className="text-xs text-slate-300 font-mono truncate max-w-md hidden xl:block"
@@ -1064,30 +1621,29 @@ export default function App() {
           {statusCaption}
         </div>
 
-        {/* Right: Grab & Toss Action Button */}
         <div className="flex items-center gap-2.5 shrink-0">
           <button
             type="button"
-            onClick={triggerCinematicGrabAndToss}
-            className="min-h-[44px] px-4 py-2 bg-white text-slate-950 text-xs font-bold rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            onClick={triggerAnimeGrabAndLaunch}
+            className="min-h-[44px] px-5 py-2 bg-white text-slate-950 text-xs font-bold rounded-lg hover:bg-slate-200 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
-            Grab &amp; Toss to Phone
+            Anime Grab &amp; Fire to Phone
           </button>
         </div>
       </footer>
 
-      {/* 10. CONNECT PHONE WITH 4-DIGIT CODE MODAL */}
+      {/* 10. ROOM CODE MODAL */}
       {showCodeModal && (
         <div
           role="dialog"
           aria-modal="true"
           aria-labelledby="connect-phone-modal-title"
-          className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4"
+          className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4"
         >
-          <div className="bg-[#0F172A] border border-white/15 rounded-xl max-w-md w-full p-6 space-y-6">
+          <div className="bg-[#0F172A] border border-white/20 rounded-xl max-w-md w-full p-6 space-y-6">
             <div className="flex items-center justify-between border-b border-white/10 pb-3">
               <h2 id="connect-phone-modal-title" className="text-lg font-bold text-white">
-                Connect Phone with Code
+                Browser-Saved Room Code
               </h2>
               <button
                 type="button"
@@ -1100,14 +1656,14 @@ export default function App() {
 
             <div className="text-center space-y-4">
               <p className="text-xs text-slate-300">
-                Open this app on your phone and enter this 4-digit code, or scan the QR code below to connect immediately:
+                Saved only in this browser tab (sessionStorage). Enter this code under &ldquo;Join Room&rdquo; on your phone:
               </p>
 
               <div
                 data-testid="pairing-four-digit-code"
                 className="py-4 px-6 bg-[#090D16] border border-white/15 rounded-xl text-4xl font-mono font-bold tracking-[0.35em] text-white tabular-nums"
               >
-                {roomCode}
+                {currentRoomCode}
               </div>
 
               {qrSvg && (
@@ -1123,13 +1679,10 @@ export default function App() {
             <div className="border-t border-white/10 pt-4 flex items-center justify-between gap-3">
               <button
                 type="button"
-                onClick={() => {
-                  setDeviceRole('phone');
-                  setShowCodeModal(false);
-                }}
-                className="flex-1 min-h-[44px] px-4 py-2 bg-white/10 border border-white/15 text-xs font-semibold text-white rounded-lg hover:bg-white/15 cursor-pointer"
+                onClick={handleDestroyRoomNow}
+                className="flex-1 min-h-[44px] px-4 py-2 bg-rose-950 border border-rose-500/40 text-xs font-semibold text-rose-200 rounded-lg hover:bg-rose-900 cursor-pointer"
               >
-                Open Phone Receiver Here
+                Destroy Room
               </button>
               <button
                 type="button"
@@ -1145,3 +1698,31 @@ export default function App() {
     </div>
   );
 }
+
+const DesktopStreamMirrorCanvas: React.FC<{ videoRef: React.RefObject<HTMLVideoElement | null> }> = ({
+  videoRef,
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const draw = () => {
+      if (!active) return;
+      const v = videoRef.current;
+      const c = canvasRef.current;
+      if (v && c && v.readyState >= 2) {
+        const ctx = c.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(v, 0, 0, c.width, c.height);
+        }
+      }
+      requestAnimationFrame(draw);
+    };
+    requestAnimationFrame(draw);
+    return () => {
+      active = false;
+    };
+  }, [videoRef]);
+
+  return <canvas ref={canvasRef} width={960} height={540} className="w-full h-full object-contain" />;
+};

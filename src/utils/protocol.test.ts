@@ -224,3 +224,63 @@ test('Spatial 4-digit code normalization, phone zone delivery detection, and cin
   assert.equal(deliveredTransform.opacity, 0);
 });
 
+import {
+  createInitialAnimeVfxState,
+  createDimensionalShards,
+  stepShardsTowardHand,
+  generateLightningPoints,
+  triggerAnimeGrabVfx,
+  triggerAnimeLaunchVfx,
+} from './animeVfxEngine';
+
+test('Anime VFX Engine spawns dimensional shards, steps vortex absorption toward hand, and triggers impact frames', () => {
+  const shards = createDimensionalShards(500, 400, 24);
+  assert.equal(shards.length, 24);
+
+  const stepped = stepShardsTowardHand(shards, 700, 300, 1);
+  assert.equal(stepped.length, 24);
+  assert.ok(stepped[0].progress > 0);
+
+  const bolts = generateLightningPoints(100, 100, 300, 250, 8, 20, 0.5);
+  assert.equal(bolts.length, 9);
+
+  let state = createInitialAnimeVfxState();
+  state = triggerAnimeGrabVfx(state, 600, 400, 720, 450);
+  assert.equal(state.impactFramesRemaining, 3);
+  assert.equal(state.shards.length, 36);
+  assert.ok(state.rings.length >= 2);
+
+  state = triggerAnimeLaunchVfx(state, 600, 400, 1380, 400);
+  assert.equal(state.impactFramesRemaining, 4);
+  assert.equal(state.beams.length, 1);
+});
+
+import {
+  saveRoomInBrowserTab,
+  loadRoomFromBrowserTab,
+  destroyRoomInBrowserTab,
+} from './spatialToss';
+
+test('Browser-only room storage saves in tab storage and destroys cleanly on tab close', () => {
+  const memoryStore = new Map<string, string>();
+  const mockStorage = {
+    setItem: (k: string, v: string) => memoryStore.set(k, v),
+    getItem: (k: string) => memoryStore.get(k) ?? null,
+    removeItem: (k: string) => memoryStore.delete(k),
+  };
+
+  saveRoomInBrowserTab(
+    { code: '7391', role: 'creator', createdAt: 1700000000000, peerConnected: false },
+    mockStorage
+  );
+  const loaded = loadRoomFromBrowserTab(mockStorage);
+  assert.ok(loaded);
+  assert.equal(loaded.code, '7391');
+  assert.equal(loaded.role, 'creator');
+
+  destroyRoomInBrowserTab(mockStorage);
+  assert.equal(loadRoomFromBrowserTab(mockStorage), null);
+});
+
+
+

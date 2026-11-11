@@ -6,16 +6,25 @@ export interface SpatialPhotoItem {
 }
 
 export type SpatialStagePhase =
-  | 'PHOTO_OPEN'       // Photo is open on screen; hand is open/hovering
+  | 'PHOTO_OPEN'       // Photo is open on laptop screen; hand is open/hovering
   | 'GRABBING_CLOSING' // Hand just pinched: photo collapses into hand in camera and closes on screen
-  | 'HOLDING_IN_HAND'  // Photo is closed on screen and held as a glowing spatial card inside the camera hand
-  | 'DELIVERING'       // Hand moved toward phone edge: cinematic launch into phone
+  | 'HOLDING_IN_HAND'  // Photo is closed on screen and held inside the Anime Energy Sphere in camera
+  | 'DELIVERING'       // Hand moved toward phone edge: God-speed anime slash launch into phone
   | 'DELIVERED';       // Photo delivered to phone and opened in full screen on phone
 
 export interface HandPoint {
   x: number; // Normalized [0..1]
   y: number; // Normalized [0..1]
 }
+
+export interface BrowserSavedRoom {
+  code: string;
+  role: 'creator' | 'joiner';
+  createdAt: number;
+  peerConnected: boolean;
+}
+
+export const BROWSER_ROOM_STORAGE_KEY = 'toss_browser_room_v1';
 
 export function normalizeRoomCode(input: string): string {
   return input.replace(/\D/g, '').slice(0, 4);
@@ -24,6 +33,42 @@ export function normalizeRoomCode(input: string): string {
 export function generateFourDigitCode(seed = Math.random()): string {
   const num = Math.floor(1000 + seed * 9000);
   return String(Math.min(9999, Math.max(1000, num)));
+}
+
+export function saveRoomInBrowserTab(room: BrowserSavedRoom, storage?: Pick<Storage, 'setItem'>): void {
+  const target = storage || (typeof window !== 'undefined' ? window.sessionStorage : undefined);
+  if (!target) return;
+  try {
+    target.setItem(BROWSER_ROOM_STORAGE_KEY, JSON.stringify(room));
+  } catch {
+    // Ignore private-browsing quota error
+  }
+}
+
+export function loadRoomFromBrowserTab(storage?: Pick<Storage, 'getItem'>): BrowserSavedRoom | null {
+  const target = storage || (typeof window !== 'undefined' ? window.sessionStorage : undefined);
+  if (!target) return null;
+  try {
+    const raw = target.getItem(BROWSER_ROOM_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as BrowserSavedRoom;
+    if (typeof parsed.code === 'string' && parsed.code.length === 4) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function destroyRoomInBrowserTab(storage?: Pick<Storage, 'removeItem'>): void {
+  const target = storage || (typeof window !== 'undefined' ? window.sessionStorage : undefined);
+  if (!target) return;
+  try {
+    target.removeItem(BROWSER_ROOM_STORAGE_KEY);
+  } catch {
+    // Ignore storage error
+  }
 }
 
 /**
