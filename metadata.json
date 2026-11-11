@@ -1,0 +1,11 @@
+{
+  "name": "Toss — Serverless WebRTC File & Stage Transfer",
+  "description": "Peer-to-peer WebRTC file and screen-region transfer with manual QR/.toss signaling, SHA-256 chunk verification, and spatial gesture throw.",
+  "requestFramePermissions": [
+    "camera",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
